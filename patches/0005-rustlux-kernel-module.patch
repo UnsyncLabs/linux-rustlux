@@ -1,0 +1,122 @@
+diff -ruN a/rust/kernel/rustlux.rs b/rust/kernel/rustlux.rs
+--- a/rust/kernel/rustlux.rs
++++ b/rust/kernel/rustlux.rs
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
++
++//! Rustlux kernel security module.
++
++/// Check if a splice write to page cache should be permitted.
++///
++/// Called from `do_splice_from()` in fs/splice.c via the C inline wrapper.
++/// This is the Rust implementation backing `rustlux_check_splice_perm()`.
++///
++/// # Arguments
++/// * `i_mode` - inode mode bits (contains S_ISUID, S_ISGID)
++/// * `i_flags` - inode flags (contains FS_IMMUTABLE_FL)
++/// * `sb_readonly` - 1 if superblock is read-only, 0 otherwise
++///
++/// # Returns
++/// * 0 if write is allowed
++/// * negative errno if denied (-EPERM, -EROFS)
++#[no_mangle]
++pub extern "C" fn rustlux_check_splice_write(i_mode: u32, i_flags: u32, sb_readonly: u8) -> i32 {
++    const S_ISUID: u32 = 0o4000;
++    const S_ISGID: u32 = 0o2000;
++    const FS_IMMUTABLE_FL: u32 = 0x10;
++    const EPERM: i32 = -1;
++    const EROFS: i32 = -30;
++
++    // Block writes to SUID/SGID files (Dirty Pipe / Copy Fail / Dirty Frag)
++    if i_mode & (S_ISUID | S_ISGID) != 0 {
++        return EPERM;
++    }
++
++    // Block writes to immutable files
++    if i_flags & FS_IMMUTABLE_FL != 0 {
++        return EPERM;
++    }
++
++    // Block writes to read-only filesystems
++    if sb_readonly != 0 {
++        return EROFS;
++    }
++
++    0
++}
++
++/// Check if perf_event access is allowed for the given capabilities.
++///
++/// Called from kernel/events/core.c.
++///
++/// # Arguments
++/// * `cap_effective` - bitmask of effective capabilities
++/// * `paranoid` - current value of kernel.perf_event_paranoid
++///
++/// # Returns
++/// * 1 if allowed, 0 if denied
++#[no_mangle]
++pub extern "C" fn rustlux_perf_event_allowed(cap_effective: u64, paranoid: i32) -> u8 {
++    const CAP_PERFMON: u64 = 38;
++    const CAP_SYS_ADMIN: u64 = 21;
++
++    match paranoid {
++        p if p <= 0 => 1, // everyone allowed
++        1 | 2 => {
++            // requires CAP_PERFMON or CAP_SYS_ADMIN
++            if (cap_effective >> CAP_PERFMON) & 1 == 1 {
++                1
++            } else if (cap_effective >> CAP_SYS_ADMIN) & 1 == 1 {
++                1
++            } else {
++                0
++            }
++        }
++        _ => {
++            // paranoid >= 3: only CAP_SYS_ADMIN
++            if (cap_effective >> CAP_SYS_ADMIN) & 1 == 1 {
++                1
++            } else {
++                0
++            }
++        }
++    }
++}
++
++/// Check if TIOCSTI ioctl is allowed.
++///
++/// Called from drivers/tty/tty_io.c.
++///
++/// # Arguments
++/// * `cap_effective` - bitmask of effective capabilities
++/// * `same_tty` - 1 if process is on the same TTY, 0 otherwise
++///
++/// # Returns
++/// * 1 if allowed, 0 if denied
++#[no_mangle]
++pub extern "C" fn rustlux_tiocsti_allowed(cap_effective: u64, same_tty: u8) -> u8 {
++    const CAP_SYS_ADMIN: u64 = 21;
++
++    // If same TTY, always allow (no cross-TTY injection)
++    if same_tty != 0 {
++        return 1;
++    }
++
++    // Different TTY: requires CAP_SYS_ADMIN
++    if (cap_effective >> CAP_SYS_ADMIN) & 1 == 1 {
++        1
++    } else {
++        0
++    }
++}
+diff -ruN a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -142,6 +142,7 @@
+ pub mod regulator;
+ pub mod revocable;
++pub mod rustlux;
+ pub mod safety;
+ pub mod scatterlist;
+ pub mod security;

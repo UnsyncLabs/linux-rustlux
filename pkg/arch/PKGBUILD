@@ -1,0 +1,495 @@
+# Maintainer: Rustlux Project <neokuze@cachyos.org>
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# PKGBUILD para linux-rustlux (Arch Linux / CachyOS)
+#
+# Uso:
+#   makepkg -si                          # defaults: GCC, BORE, 1000Hz
+#   _use_llvm_lto=thin makepkg -si       # Clang + Thin LTO
+#   _processor_opt=zen4 makepkg -si      # Optimizado para Zen4
+#   _build_zfs=yes makepkg -si           # Con modulo ZFS
+#   _build_nvidia_open=yes makepkg -si   # Con modulo NVIDIA open
+
+### ═══════════════════════════════════════════════════════════════════════════
+### BUILD OPTIONS — override con variables de entorno o editar aqui
+### ═══════════════════════════════════════════════════════════════════════════
+
+## Compilador y LTO
+# "none" = GCC sin LTO (default)
+# "thin" = Clang + Thin LTO (rapido, buen rendimiento)
+# "full" = Clang + Full LTO (lento, maximo rendimiento teorico)
+: "${_use_llvm_lto:=none}"
+
+## CPU target
+# "" o "native" = autodetect del CPU actual (-march=native)
+# "zen4"        = AMD Zen4 (znver4)
+# "generic"     = x86-64 generico (para compartir el paquete)
+# "generic_v3"  = x86-64-v3 (AVX2, BMI2, FMA — la mayoria de CPUs modernos)
+# "generic_v4"  = x86-64-v4 (AVX-512)
+: "${_processor_opt:=}"
+
+## Scheduler
+# "bore"     = BORE + EEVDF (default, mejor interactividad)
+# "eevdf"    = EEVDF vanilla (sin BORE)
+: "${_cpusched:=bore}"
+
+## Timer tick rate
+# 1000 = mejor latencia (gaming/desktop)
+# 750/500 = balance
+# 300 = mejor throughput (server)
+: "${_HZ_ticks:=1000}"
+
+## Tick type
+# "full"     = full tickless (mejor rendimiento variable)
+# "idle"     = idle tickless (mas consistente)
+: "${_tickrate:=full}"
+
+## Preemption
+# "full" = full preempt (menor latencia)
+# "lazy" = lazy preempt (mejor throughput)
+: "${_preempt:=full}"
+
+## Transparent Hugepages
+# "always"  = siempre activo (mejor para desktop/gaming)
+# "madvise" = solo cuando la app lo pide
+: "${_hugepage:=always}"
+
+## Optimizaciones de compilacion
+# "yes" = -O3 (default)
+# "no"  = -O2
+: "${_cc_harder:=yes}"
+
+## TCP congestion
+# "yes" = BBR3 como default
+# "no"  = CUBIC (default del kernel)
+: "${_tcp_bbr3:=no}"
+
+## Modulos extra
+: "${_build_zfs:=no}"
+: "${_build_nvidia_open:=no}"
+
+## kCFI (Control Flow Integrity, solo con Clang)
+: "${_use_kcfi:=no}"
+
+## Tweak interactivo antes de compilar
+: "${_makenconfig:=no}"
+
+## Usar config del kernel actual
+: "${_use_current:=no}"
+
+## localmodcfg (compilar solo modulos usados)
+: "${_localmodcfg:=no}"
+: "${_localmodcfg_path:="$HOME/.config/modprobed.db"}"
+
+### ═══════════════════════════════════════════════════════════════════════════
+### PACKAGE METADATA
+### ═══════════════════════════════════════════════════════════════════════════
+
+_is_lto_kernel() {
+    [[ "$_use_llvm_lto" = "thin" || "$_use_llvm_lto" = "full" ]]
+}
+
+_die() { error "$@" ; exit 1; }
+
+if _is_lto_kernel; then
+    _pkgsuffix="rustlux-lto"
+else
+    _pkgsuffix="rustlux"
+fi
+
+# Append CPU target to suffix if specified (e.g. rustlux-lto-zen4)
+if [ -n "$_processor_opt" ] && [ "$_processor_opt" != "native" ] && [ "$_processor_opt" != "generic" ]; then
+    _pkgsuffix="${_pkgsuffix}-${_processor_opt}"
+fi
+
+pkgbase="linux-${_pkgsuffix}"
+_major=7.0
+_minor=9
+pkgver=${_major}.${_minor}
+pkgrel=1
+_srcname="linux-${pkgver}"
+pkgdesc="Rustlux Kernel — BORE+EEVDF, hardened, Rust-enabled"
+arch=('x86_64')
+url="https://gitea.neokuze.org/neokuze/linux-rustlux"
+license=('GPL-2.0-only')
+options=('!strip' '!debug' '!lto')
+
+makedepends=(
+    bc binutils cpio gettext glibc libelf libgcc
+    openssl pahole perl python tar xz zstd
+    rust rust-bindgen rust-src
+)
+
+if _is_lto_kernel; then
+    makedepends+=(clang llvm lld)
+    BUILD_FLAGS=(CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1)
+else
+    BUILD_FLAGS=()
+fi
+
+if [ "$_build_zfs" = "yes" ]; then
+    makedepends+=(git)
+fi
+
+_patchdir="${startdir}/../../patches"
+_configdir="${startdir}/../../config"
+
+source=(
+    "https://cdn.kernel.org/pub/linux/kernel/v${_major%%.*}.x/${_srcname}.tar.xz"
+    "https://cdn.kernel.org/pub/linux/kernel/v${_major%%.*}.x/${_srcname}.tar.sign"
+)
+
+sha256sums=('SKIP' 'SKIP')
+
+validpgpkeys=(
+    'ABAF11C65A2970B130ABE3C479BE3E4300411886'
+    '647F28654894E3BD457199BE38DBBDC86092693E'
+)
+
+# ZFS source
+if [ "$_build_zfs" = "yes" ]; then
+    source+=("git+https://github.com/cachyos/zfs.git#commit=6330a45b06d20125de679aae5f63ba14082671ef")
+    sha256sums+=('SKIP')
+fi
+
+export KBUILD_BUILD_HOST=rustlux
+export KBUILD_BUILD_USER="$pkgbase"
+export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+
+prepare() {
+    cd "${_srcname}"
+
+    echo "Setting version..."
+    echo "-${pkgrel}-${_pkgsuffix}" > localversion.10-pkgrel
+
+    # ── Patches ──────────────────────────────────────────────────────────────
+    echo "Applying hardened patch..."
+    patch -Np1 --forward -i "${_patchdir}/0001-hardened.patch" || true
+
+    echo "Applying BORE scheduler patch..."
+    patch -Np1 -i "${_patchdir}/0002-bore-cachy.patch"
+
+    if _is_lto_kernel; then
+        echo "Applying dkms-clang patch..."
+        patch -Np1 -i "${_patchdir}/0003-dkms-clang.patch"
+    fi
+
+    echo "Applying Rustlux splice guard (Dirty Pipe/Copy Fail/Dirty Frag mitigation)..."
+    patch -Np1 -i "${_patchdir}/0004-rustlux-splice-guard.patch"
+
+    echo "Applying Rustlux kernel module (Rust FFI security functions)..."
+    patch -Np1 -i "${_patchdir}/0005-rustlux-kernel-module.patch"
+
+    echo "Applying Rustlux perf hook..."
+    patch -Np1 -i "${_patchdir}/0006-rustlux-perf-hook.patch"
+
+    echo "Applying Rustlux tiocsti hook..."
+    patch -Np1 -i "${_patchdir}/0007-rustlux-tiocsti-hook.patch"
+
+    # ── Config base ──────────────────────────────────────────────────────────
+    echo "Setting config..."
+    cp "${_configdir}/rustlux_desktop.config" .config
+
+    # Limpiar CONFIG_LOCALVERSION (lo controlamos via localversion file)
+    scripts/config --set-str LOCALVERSION ""
+    scripts/config -d LOCALVERSION_AUTO
+
+    # ── CPU optimization ─────────────────────────────────────────────────────
+    if [ -n "$_processor_opt" ]; then
+        MARCH="${_processor_opt^^}"
+        case "$MARCH" in
+            GENERIC_V[1-4]|GENERIC_V3|GENERIC_V4)
+                scripts/config -e GENERIC_CPU -d MZEN4 -d X86_NATIVE_CPU \
+                    --set-val X86_64_VERSION "${MARCH//GENERIC_V}";;
+            ZEN4)
+                scripts/config -d GENERIC_CPU -e MZEN4 -d X86_NATIVE_CPU;;
+            NATIVE|"")
+                scripts/config -d GENERIC_CPU -d MZEN4 -e X86_NATIVE_CPU;;
+            GENERIC)
+                scripts/config -e GENERIC_CPU -d MZEN4 -d X86_NATIVE_CPU;;
+        esac
+        echo "CPU target: ${MARCH}"
+    else
+        scripts/config -d GENERIC_CPU -d MZEN4 -e X86_NATIVE_CPU
+        echo "CPU target: native (autodetect)"
+    fi
+
+    # ── Scheduler ────────────────────────────────────────────────────────────
+    case "$_cpusched" in
+        bore) scripts/config -e SCHED_BORE;;
+        eevdf) ;;
+        *) _die "Invalid scheduler: $_cpusched";;
+    esac
+    echo "Scheduler: ${_cpusched^^}"
+
+    # ── LTO ──────────────────────────────────────────────────────────────────
+    case "$_use_llvm_lto" in
+        thin) scripts/config -e LTO_CLANG_THIN;;
+        full) scripts/config -e LTO_CLANG_FULL;;
+        none) scripts/config -e LTO_NONE;;
+        *) _die "Invalid LTO: $_use_llvm_lto";;
+    esac
+
+    # ── kCFI ─────────────────────────────────────────────────────────────────
+    if [ "$_use_kcfi" = "yes" ]; then
+        scripts/config -e ARCH_SUPPORTS_CFI_CLANG -e CFI_CLANG -e CFI_AUTO_DEFAULT
+        echo "kCFI: enabled"
+    fi
+
+    # ── Timer ────────────────────────────────────────────────────────────────
+    case "$_HZ_ticks" in
+        100|250|300|500|600|750|1000)
+            scripts/config -d HZ_300 -e "HZ_${_HZ_ticks}" --set-val HZ "${_HZ_ticks}";;
+        *) _die "Invalid HZ: $_HZ_ticks";;
+    esac
+
+    # ── Tick type ────────────────────────────────────────────────────────────
+    case "$_tickrate" in
+        full) scripts/config -d HZ_PERIODIC -d NO_HZ_IDLE -d CONTEXT_TRACKING_FORCE \
+            -e NO_HZ_FULL_NODEF -e NO_HZ_FULL -e NO_HZ -e NO_HZ_COMMON -e CONTEXT_TRACKING;;
+        idle) scripts/config -d HZ_PERIODIC -d NO_HZ_FULL -e NO_HZ_IDLE -e NO_HZ -e NO_HZ_COMMON;;
+        *) _die "Invalid tickrate: $_tickrate";;
+    esac
+
+    # ── Preemption ───────────────────────────────────────────────────────────
+    case "$_preempt" in
+        full) scripts/config -e PREEMPT -d PREEMPT_LAZY;;
+        lazy) scripts/config -d PREEMPT -e PREEMPT_LAZY;;
+        *) _die "Invalid preempt: $_preempt";;
+    esac
+
+    # ── THP ──────────────────────────────────────────────────────────────────
+    case "$_hugepage" in
+        always) scripts/config -d TRANSPARENT_HUGEPAGE_MADVISE -e TRANSPARENT_HUGEPAGE_ALWAYS;;
+        madvise) scripts/config -d TRANSPARENT_HUGEPAGE_ALWAYS -e TRANSPARENT_HUGEPAGE_MADVISE;;
+    esac
+
+    # ── -O3 ──────────────────────────────────────────────────────────────────
+    if [ "$_cc_harder" = "yes" ]; then
+        scripts/config -d CC_OPTIMIZE_FOR_PERFORMANCE -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
+    fi
+
+    # ── BBR3 ─────────────────────────────────────────────────────────────────
+    if [ "$_tcp_bbr3" = "yes" ]; then
+        scripts/config -m TCP_CONG_CUBIC -d DEFAULT_CUBIC \
+            -e TCP_CONG_BBR -e DEFAULT_BBR --set-str DEFAULT_TCP_CONG bbr \
+            -m NET_SCH_FQ_CODEL -e NET_SCH_FQ
+    fi
+
+    # ── Rust ─────────────────────────────────────────────────────────────────
+    scripts/config -e RUST
+
+    # ── BORE tuning ──────────────────────────────────────────────────────────
+    if [ "$_cpusched" = "bore" ]; then
+        scripts/config --set-val MIN_BASE_SLICE_NS 2000000
+    fi
+
+    # ── Hardening (Rustlux defaults) ─────────────────────────────────────────
+    scripts/config -e SECURITY_YAMA -e HARDENED_USERCOPY -e FORTIFY_SOURCE \
+        -e INIT_ON_ALLOC_DEFAULT_ON -e RANDOMIZE_KSTACK_OFFSET_DEFAULT \
+        -e PAGE_TABLE_ISOLATION
+
+    # ── ZFS requirements ─────────────────────────────────────────────────────
+    if [ "$_build_zfs" = "yes" ]; then
+        scripts/config -e MODULES -e CRYPTO_DEFLATE -e ZLIB_DEFLATE -e ZLIB_INFLATE
+        echo "ZFS: enabled (CONFIG_MODULES=y)"
+    fi
+
+    # ── Compresiones para initramfs ──────────────────────────────────────────
+    scripts/config -m CRYPTO_LZO -m CRYPTO_LZ4
+    scripts/config -e LZO_COMPRESS -e LZO_DECOMPRESS
+    scripts/config -e LZ4_COMPRESS -e LZ4_DECOMPRESS
+
+    # ── Disable debug for production ─────────────────────────────────────────
+    scripts/config -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -e DEBUG_INFO_NONE
+
+    # ── localmodcfg ──────────────────────────────────────────────────────────
+    if [ "$_localmodcfg" = "yes" ]; then
+        if [ -e "$_localmodcfg_path" ]; then
+            echo "Running localmodconfig..."
+            make "${BUILD_FLAGS[@]}" LSMOD="${_localmodcfg_path}" localmodconfig
+        else
+            _die "No modprobed.db found at $_localmodcfg_path"
+        fi
+    fi
+
+    # ── Use current config ───────────────────────────────────────────────────
+    if [ "$_use_current" = "yes" ] && [[ -s /proc/config.gz ]]; then
+        zcat /proc/config.gz > .config
+    fi
+
+    # ── Finalize ─────────────────────────────────────────────────────────────
+    # LTO + DEBUG_INFO_BTF blocks CONFIG_RUST in 7.0.9
+    # Disable BTF when Rust is requested with LTO
+    if _is_lto_kernel; then
+        scripts/config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES
+    fi
+    scripts/config -e RUST
+    make "${BUILD_FLAGS[@]}" olddefconfig
+
+    diff -u "${_configdir}/rustlux_desktop.config" .config || true
+
+    make -s kernelrelease > version
+    echo "Prepared $pkgbase version $(<version)"
+
+    [[ "$_makenconfig" = "yes" ]] && make "${BUILD_FLAGS[@]}" nconfig
+
+    return 0
+}
+
+build() {
+    cd "${_srcname}"
+    make "${BUILD_FLAGS[@]}" -j"$(nproc)" all
+
+    # ZFS
+    if [ "$_build_zfs" = "yes" ]; then
+        cd "${srcdir}/zfs"
+        local CONFIGURE_FLAGS=()
+        _is_lto_kernel && CONFIGURE_FLAGS+=("KERNEL_LLVM=1")
+
+        ./autogen.sh
+        sed -i "s|\$(uname -r)|${pkgver}-${_pkgsuffix}|g" configure
+        ./configure "${CONFIGURE_FLAGS[@]}" --prefix=/usr --sysconfdir=/etc \
+            --sbindir=/usr/bin --libdir=/usr/lib --datadir=/usr/share \
+            --includedir=/usr/include --with-udevdir=/lib/udev \
+            --libexecdir=/usr/lib/zfs --with-config=kernel \
+            --with-linux="${srcdir}/${_srcname}"
+        make "${BUILD_FLAGS[@]}"
+    fi
+}
+
+_package() {
+    pkgdesc="Rustlux Kernel ${pkgver} — BORE+EEVDF hardened Rust-enabled"
+    depends=('coreutils' 'kmod' 'initramfs')
+    optdepends=(
+        'wireless-regdb: correct wireless channels'
+        'linux-firmware: firmware for hardware'
+        'scx-scheds: sched-ext userspace schedulers'
+    )
+    provides=(VIRTUALBOX-GUEST-MODULES WIREGUARD-MODULE KSMBD-MODULE NTSYNC-MODULE)
+
+    cd "${_srcname}"
+    local modulesdir="$pkgdir/usr/lib/modules/$(<version)"
+
+    echo "Installing boot image..."
+    install -Dm644 "$(make -s image_name)" "$modulesdir/vmlinuz"
+    echo "$pkgbase" | install -Dm644 /dev/stdin "$modulesdir/pkgbase"
+
+    echo "Installing modules..."
+    ZSTD_CLEVEL=19 make "${BUILD_FLAGS[@]}" INSTALL_MOD_PATH="$pkgdir/usr" \
+        INSTALL_MOD_STRIP=1 DEPMOD=/doesnt/exist modules_install
+
+    rm -f "$modulesdir"/build
+
+    # modprobe configs
+    install -Dm644 "${_configdir}/modprobe.d/rustlux-security.conf" \
+        "${pkgdir}/usr/lib/modprobe.d/rustlux-security.conf"
+    install -Dm644 "${_configdir}/modprobe.d/rustlux-defaults.conf" \
+        "${pkgdir}/usr/lib/modprobe.d/rustlux-defaults.conf"
+
+    # sysctl hardening
+    install -Dm644 "${_configdir}/sysctl.d/90-rustlux-hardening.conf" \
+        "${pkgdir}/usr/lib/sysctl.d/90-rustlux-hardening.conf"
+}
+
+_package-headers() {
+    pkgdesc="Headers for building modules against ${pkgbase}"
+    depends=(pahole "${pkgbase}")
+    provides=(LINUX-HEADERS)
+
+    if _is_lto_kernel; then
+        depends+=(clang llvm lld)
+    fi
+
+    cd "${_srcname}"
+    local builddir="$pkgdir/usr/lib/modules/$(<version)/build"
+
+    echo "Installing build files..."
+    install -Dt "$builddir" -m644 .config Makefile Module.symvers System.map \
+        localversion.* version vmlinux
+
+    install -Dt "$builddir/kernel" -m644 kernel/Makefile
+    install -Dt "$builddir/arch/x86" -m644 arch/x86/Makefile
+    cp -t "$builddir" -a scripts
+
+    install -Dt "$builddir/tools/objtool" tools/objtool/objtool
+    if [ -f tools/bpf/resolve_btfids/resolve_btfids ]; then
+        install -Dt "$builddir/tools/bpf/resolve_btfids" \
+            tools/bpf/resolve_btfids/resolve_btfids
+    fi
+
+    echo "Installing headers..."
+    cp -t "$builddir" -a include
+    cp -t "$builddir/arch/x86" -a arch/x86/include
+    install -Dt "$builddir/arch/x86/kernel" -m644 arch/x86/kernel/asm-offsets.s
+    install -Dt "$builddir/drivers/md" -m644 drivers/md/*.h
+    install -Dt "$builddir/net/mac80211" -m644 net/mac80211/*.h
+    install -Dt "$builddir/drivers/media/i2c" -m644 drivers/media/i2c/msp3400-driver.h
+    install -Dt "$builddir/drivers/media/usb/dvb-usb" -m644 drivers/media/usb/dvb-usb/*.h
+    install -Dt "$builddir/drivers/media/dvb-frontends" -m644 drivers/media/dvb-frontends/*.h
+    install -Dt "$builddir/drivers/media/tuners" -m644 drivers/media/tuners/*.h
+
+    echo "Installing KConfig files..."
+    find . -name 'Kconfig*' -exec install -Dm644 {} "$builddir/{}" \;
+
+    # Rust support for out-of-tree modules
+    if compgen -G "rust/*.rmeta" 1>/dev/null; then
+        install -Dt "$builddir/rust" -m644 rust/*.rmeta
+    fi
+    if compgen -G "rust/*.so" 1>/dev/null; then
+        install -Dt "$builddir/rust" rust/*.so
+    fi
+
+    echo "Removing unneeded architectures..."
+    local arch
+    for arch in "$builddir"/arch/*/; do
+        [[ $arch = */x86/ ]] && continue
+        rm -r "$arch"
+    done
+
+    rm -r "$builddir/Documentation" 2>/dev/null || true
+    find -L "$builddir" -type l -delete
+    find "$builddir" -type f -name '*.o' -delete
+
+    echo "Stripping build tools..."
+    local file
+    while read -rd '' file; do
+        case "$(file -Sib "$file")" in
+            application/x-sharedlib\;*)      strip -v $STRIP_SHARED "$file";;
+            application/x-archive\;*)        strip -v $STRIP_STATIC "$file";;
+            application/x-executable\;*)     strip -v $STRIP_BINARIES "$file";;
+            application/x-pie-executable\;*) strip -v $STRIP_SHARED "$file";;
+        esac
+    done < <(find "$builddir" -type f -perm -u+x ! -name vmlinux -print0)
+
+    strip -v $STRIP_STATIC "$builddir/vmlinux"
+
+    mkdir -p "$pkgdir/usr/src"
+    ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+}
+
+_package-zfs() {
+    pkgdesc="ZFS module for ${pkgbase}"
+    depends=('pahole' "${pkgbase}=${pkgver}-${pkgrel}")
+    provides=('ZFS-MODULE')
+    license=('CDDL')
+
+    cd "${_srcname}"
+    local modulesdir="$pkgdir/usr/lib/modules/$(<version)/extramodules"
+
+    cd "${srcdir}/zfs"
+    install -dm755 "${modulesdir}"
+    install -m644 module/*.ko "${modulesdir}"
+    find "$pkgdir" -name '*.ko' -exec zstd --rm -19 -T0 {} +
+}
+
+# ── Package list ─────────────────────────────────────────────────────────────
+pkgname=("$pkgbase" "$pkgbase-headers")
+[ "$_build_zfs" = "yes" ] && pkgname+=("$pkgbase-zfs")
+
+for _p in "${pkgname[@]}"; do
+    eval "package_$_p() {
+        $(declare -f "_package${_p#$pkgbase}")
+        _package${_p#$pkgbase}
+    }"
+done

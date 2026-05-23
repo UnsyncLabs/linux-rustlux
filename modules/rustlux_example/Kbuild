@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Kbuild file for rustlux_example module
+#
+# Este archivo le dice al sistema de build del kernel cómo compilar
+# el módulo. Funciona tanto con módulos C como Rust.
+
+obj-m := rustlux_example.o

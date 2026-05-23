@@ -1,0 +1,18 @@
+Rustlux Kernel
+Copyright (C) 2026 Rustlux Project
+
+This project is based on the Linux kernel (https://kernel.org),
+which is licensed under GPL-2.0-only.
+
+Original Rust components written for Rustlux (found under rust/rustlux/)
+are dual-licensed under GPL-2.0-only.
+
+If you use the original Rust components of this project, you must retain
+this notice and the copyright attribution in all copies or substantial
+portions of the software.
+
+Third-party components:
+- Linux kernel (GPL-2.0-only): https://kernel.org
+- BORE CPU Scheduler (GPL-2.0-only): Copyright (C) 2021-2025 Masahito Suzuki
+- linux-hardened patches (GPL-2.0-only): https://github.com/anthraxx/linux-hardened
+- Claude's C Compiler / CCC (CC0-1.0): https://github.com/anthropics/claudes-c-compiler

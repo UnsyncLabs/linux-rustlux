@@ -1,0 +1,35 @@
+
+
+# ── Build artifacts ──────────────────────────────────────────────
+target/
+build/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# ── Kernel source descargado (se baja con make kernel-fetch) ─────
+kernel/
+
+# ── CCC compilado (se baja con make ccc-build) ───────────────────
+tools/ccc/
+
+# ── Claves de firma de módulos (privadas) ────────────────────────
+*.pem
+*.x509
+signing_key.*
+
+# ── Editor / IDE ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

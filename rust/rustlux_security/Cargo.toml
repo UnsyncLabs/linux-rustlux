@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
+[package]
+name        = "rustlux_security"
+description = "Rustlux security hardening — ASLR, capabilities, hardened defaults"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[lib]
+crate-type = ["rlib"]

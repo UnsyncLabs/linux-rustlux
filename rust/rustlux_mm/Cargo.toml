@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
+[package]
+name        = "rustlux_mm"
+description = "Rustlux memory management — page cache write protection"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# Habilitar checks extra en debug builds
+debug_page_perms = []

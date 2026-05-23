@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-only
+# Rustlux Kernel — workspace root
+
+[workspace]
+resolver = "2"
+members = [
+    "rust/rustlux_mm",
+    "rust/rustlux_sched",
+    "rust/rustlux_security",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Rustlux Project"]
+license     = "GPL-2.0-only"
+repository  = "https://github.com/UnsyncLabs/linux-rustlux"
+
+[workspace.dependencies]
+# No std — kernel environment
+# Crates compartidos entre los subcrates de rustlux

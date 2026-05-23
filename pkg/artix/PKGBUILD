@@ -1,0 +1,275 @@
+# Maintainer: Rustlux Project <neokuze@cachyos.org>
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# PKGBUILD para linux-rustlux
+# Compatible con Arch Linux, Artix Linux, CachyOS
+#
+# Instalar:
+#   cd pkg && makepkg -si
+#
+# Variables de entorno opcionales:
+#   _compiler=gcc|clang    (default: gcc)
+#   _lto=thin|full|none    (default: none)
+
+pkgbase=linux-rustlux
+pkgname=('linux-rustlux' 'linux-rustlux-headers')
+_kernver=7.0.9
+pkgver=${_kernver}
+pkgrel=1
+pkgdesc="Rustlux Kernel — BORE+EEVDF, hardened, Rust-enabled, s6-compatible"
+arch=('x86_64')
+url="https://gitea.neokuze.org/neokuze/linux-rustlux"
+license=('GPL-2.0-only')
+options=('!strip' '!debug')
+
+# ── Compilador configurable ──────────────────────────────────────────────────
+_compiler="${_compiler:-gcc}"
+
+makedepends=(
+    'bc'
+    'cpio'
+    'gettext'
+    'libelf'
+    'pahole'
+    'perl'
+    'python'
+    'tar'
+    'xz'
+    'zstd'
+    # Rust en el kernel
+    'rust'
+    'rust-bindgen'
+)
+
+if [[ "$_compiler" == "clang" ]]; then
+    makedepends+=('clang' 'llvm' 'lld')
+else
+    makedepends+=('gcc')
+fi
+
+_srcname="linux-${_kernver}"
+_patchdir="${startdir}/../patches"
+
+source=(
+    "https://cdn.kernel.org/pub/linux/kernel/v7.x/${_srcname}.tar.xz"
+    "https://cdn.kernel.org/pub/linux/kernel/v7.x/${_srcname}.tar.sign"
+)
+
+sha256sums=(
+    'SKIP'
+    'SKIP'
+)
+
+validpgpkeys=(
+    'ABAF11C65A2970B130ABE3C479BE3E4300411886'  # Linus Torvalds
+    '647F28654894E3BD457199BE38DBBDC86092693E'  # Greg Kroah-Hartman
+)
+
+export KBUILD_BUILD_HOST=rustlux
+export KBUILD_BUILD_USER=builder
+export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+
+prepare() {
+    cd "${_srcname}"
+
+    echo "==> Aplicando patch hardened..."
+    patch -Np1 --forward -i "${_patchdir}/0001-hardened.patch" || true
+
+    echo "==> Aplicando patch BORE (scheduler)..."
+    patch -Np1 -i "${_patchdir}/0002-bore-cachy.patch"
+
+    echo "==> Aplicando patch dkms-clang..."
+    patch -Np1 -i "${_patchdir}/0003-dkms-clang.patch"
+
+    echo "==> Aplicando patch rustlux splice guard..."
+    patch -Np1 -i "${_patchdir}/0004-rustlux-splice-guard.patch"
+
+    echo "==> Aplicando patch rustlux kernel module (Rust FFI)..."
+    patch -Np1 -i "${_patchdir}/0005-rustlux-kernel-module.patch"
+
+    echo "==> Aplicando patch rustlux perf hook..."
+    patch -Np1 -i "${_patchdir}/0006-rustlux-perf-hook.patch"
+
+    echo "==> Aplicando patch rustlux tiocsti hook..."
+    patch -Np1 -i "${_patchdir}/0007-rustlux-tiocsti-hook.patch"
+
+    echo "==> Copiando config de Rustlux..."
+    cp "${startdir}/../config/rustlux_desktop.config" .config
+
+    # ── Configurar compilador ────────────────────────────────────────────────
+    if [[ "$_compiler" == "clang" ]]; then
+        scripts/config -e LTO_CLANG_THIN
+        echo "==> Usando Clang + Thin LTO"
+    fi
+
+    # ── Activar BORE ─────────────────────────────────────────────────────────
+    scripts/config -e SCHED_BORE
+    scripts/config --set-val MIN_BASE_SLICE_NS 2000000
+
+    # ── Activar Rust ─────────────────────────────────────────────────────────
+    scripts/config -e RUST
+
+    # ── Timer a 1000Hz (desktop) ─────────────────────────────────────────────
+    scripts/config -d HZ_300
+    scripts/config -e HZ_1000
+    scripts/config --set-val HZ 1000
+
+    # ── Hardening extras ─────────────────────────────────────────────────────
+    scripts/config -e SECURITY_YAMA
+    scripts/config -e HARDENED_USERCOPY
+    scripts/config -e FORTIFY_SOURCE
+    scripts/config -e INIT_ON_ALLOC_DEFAULT_ON
+    scripts/config -e INIT_ON_FREE_DEFAULT_ON
+    scripts/config -e RANDOMIZE_KSTACK_OFFSET_DEFAULT
+    scripts/config -e PAGE_TABLE_ISOLATION
+
+    # ── Desactivar debug innecesario para producción ─────────────────────────
+    scripts/config -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+    scripts/config -e DEBUG_INFO_NONE
+
+    # ── Finalizar config ─────────────────────────────────────────────────────
+    make ARCH=x86_64 olddefconfig
+    diff -u "${startdir}/../config/rustlux_desktop.config" .config || true
+
+    make -s kernelrelease > version
+    echo "==> Preparado: linux-rustlux $(cat version)"
+}
+
+build() {
+    cd "${_srcname}"
+
+    local _make_opts=(
+        ARCH=x86_64
+        -j"$(nproc)"
+    )
+
+    if [[ "$_compiler" == "clang" ]]; then
+        _make_opts+=(
+            CC=clang
+            HOSTCC=clang
+            LLVM=1
+            LLVM_IAS=1
+        )
+    else
+        _make_opts+=(
+            CC=gcc
+            HOSTCC=gcc
+        )
+    fi
+
+    make "${_make_opts[@]}" all
+}
+
+_package() {
+    pkgdesc="Rustlux Kernel — Linux ${_kernver} BORE+EEVDF hardened"
+    depends=('coreutils' 'kmod' 'initramfs')
+    optdepends=(
+        's6: init system recomendado para Rustlux'
+        's6-rc: gestor de servicios para s6'
+        'mdevd: gestor de dispositivos sin systemd/udev'
+        'dkms: soporte para módulos externos (NVIDIA, etc.)'
+    )
+    provides=("linux=${_kernver}" "VIRTUALBOX-GUEST-MODULES" "WIREGUARD-MODULE")
+    conflicts=('linux-rustlux')
+    backup=("etc/mkinitcpio.d/${pkgbase}.preset")
+
+    cd "${_srcname}"
+    local kernver="$(cat version)"
+    local modulesdir="${pkgdir}/usr/lib/modules/${kernver}"
+
+    echo "==> Instalando bzImage..."
+    install -Dm644 arch/x86/boot/bzImage \
+        "${pkgdir}/boot/vmlinuz-${pkgbase}"
+
+    echo "==> Instalando módulos..."
+    make ARCH=x86_64 \
+         INSTALL_MOD_PATH="${pkgdir}/usr" \
+         INSTALL_MOD_STRIP=1 \
+         modules_install
+
+    # Eliminar symlinks build/source (van en -headers)
+    rm -f "${modulesdir}"/{build,source}
+
+    echo "==> Instalando preset de mkinitcpio..."
+    install -Dm644 /dev/stdin \
+        "${pkgdir}/etc/mkinitcpio.d/${pkgbase}.preset" << EOF
+# mkinitcpio preset para linux-rustlux
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-${pkgbase}"
+
+PRESETS=('default' 'fallback')
+
+default_image="/boot/initramfs-${pkgbase}.img"
+fallback_image="/boot/initramfs-${pkgbase}-fallback.img"
+fallback_options="-S autodetect"
+EOF
+
+    echo "==> Instalando configuración de módulos..."
+    install -Dm644 "${startdir}/../config/modprobe.d/rustlux-security.conf" \
+        "${pkgdir}/usr/lib/modprobe.d/rustlux-security.conf"
+    install -Dm644 "${startdir}/../config/modprobe.d/rustlux-defaults.conf" \
+        "${pkgdir}/usr/lib/modprobe.d/rustlux-defaults.conf"
+
+    echo "==> Instalando sysctl hardening..."
+    install -Dm644 "${startdir}/../config/sysctl.d/90-rustlux-hardening.conf" \
+        "${pkgdir}/usr/lib/sysctl.d/90-rustlux-hardening.conf"
+}
+
+_package-headers() {
+    pkgdesc="Headers para linux-rustlux ${_kernver}"
+    depends=('pahole')
+    provides=("linux-headers=${_kernver}")
+
+    cd "${_srcname}"
+    local kernver="$(cat version)"
+    local builddir="${pkgdir}/usr/lib/modules/${kernver}/build"
+
+    echo "==> Instalando headers de compilación..."
+    install -Dt "${builddir}" -m644 .config Makefile Module.symvers \
+        System.map vmlinux
+
+    install -Dt "${builddir}/kernel" -m644 kernel/Makefile
+    install -Dt "${builddir}/arch/x86" -m644 arch/x86/Makefile
+
+    cp -t "${builddir}" -a scripts
+
+    # objtool (necesario para DKMS)
+    install -Dt "${builddir}/tools/objtool" tools/objtool/objtool
+    if [[ -f tools/bpf/resolve_btfids/resolve_btfids ]]; then
+        install -Dt "${builddir}/tools/bpf/resolve_btfids" \
+            tools/bpf/resolve_btfids/resolve_btfids
+    fi
+
+    # Headers del kernel
+    cp -t "${builddir}" -a include
+    cp -t "${builddir}/arch/x86" -a arch/x86/include
+    install -Dt "${builddir}/arch/x86/kernel" -m644 \
+        arch/x86/kernel/asm-offsets.s
+
+    install -Dt "${builddir}/drivers/md" -m644 drivers/md/*.h
+    install -Dt "${builddir}/net/mac80211" -m644 net/mac80211/*.h
+
+    # Kconfig files
+    find . -name 'Kconfig*' -exec install -Dm644 {} "${builddir}/{}" \;
+
+    # Rust bindings (para módulos Rust out-of-tree)
+    if [[ -d rust ]]; then
+        install -Dt "${builddir}/rust" -m644 rust/Makefile
+        cp -t "${builddir}/rust" -a rust/bindings rust/helpers rust/kernel 2>/dev/null || true
+    fi
+
+    # Eliminar archivos innecesarios
+    find "${builddir}" -type f -name '*.o' -delete
+    find "${builddir}" -type f -name '*.cmd' -delete
+
+    # Symlink
+    ln -sr "${builddir}" "${pkgdir}/usr/lib/modules/${kernver}/build"
+}
+
+pkgname=("${pkgbase}" "${pkgbase}-headers")
+for _p in "${pkgname[@]}"; do
+    eval "package_${_p}() {
+        $(declare -f "_package${_p#${pkgbase}}")
+        _package${_p#${pkgbase}}
+    }"
+done

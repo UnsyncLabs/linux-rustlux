@@ -1,0 +1,29 @@
+--- a/kernel/events/core.c	2026-05-21 12:39:40.934878191 -0400
++++ b/kernel/events/core.c	2026-05-21 12:55:43.940574834 -0400
+@@ -58,6 +58,10 @@
+ #include <linux/percpu-rwsem.h>
+ #include <linux/unwind_deferred.h>
+ #include <linux/kvm_types.h>
++#ifdef CONFIG_RUST
++#include <linux/rustlux_guard.h>
++extern u8 rustlux_perf_event_allowed(u64 cap_effective, int paranoid);
++#endif
+ 
+ #include "internal.h"
+ 
+@@ -14690,6 +14694,15 @@
+ 
+ int perf_allow_kernel(void)
+ {
++#ifdef CONFIG_RUST
++	{
++		u64 cap_eff = current_cred()->cap_effective.val;
++		if (!rustlux_perf_event_allowed(cap_eff,
++						sysctl_perf_event_paranoid))
++			return -EACCES;
++		return security_perf_event_open(PERF_SECURITY_KERNEL);
++	}
++#endif
+ 	if (sysctl_perf_event_paranoid > 1 && !perfmon_capable())
+ 		return -EACCES;
+ 

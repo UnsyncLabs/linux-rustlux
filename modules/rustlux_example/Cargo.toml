@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Módulo de ejemplo para Rustlux
+# Demuestra cómo escribir un módulo del kernel en Rust
+
+[package]
+name = "rustlux_example"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Example Rustlux kernel module"
+
+[lib]
+crate-type = ["staticlib"]
