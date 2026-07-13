@@ -1,0 +1,13 @@
+# Archivos que deben mantener LF siempre (se usan/aplican en Linux)
+*.patch   text eol=lf
+*.rs      text eol=lf
+*.c       text eol=lf
+*.h       text eol=lf
+*.sh      text eol=lf
+*.conf    text eol=lf
+*.config  text eol=lf
+*.toml    text eol=lf
+Makefile  text eol=lf
+Kbuild    text eol=lf
+PKGBUILD  text eol=lf
+dkms.conf text eol=lf
