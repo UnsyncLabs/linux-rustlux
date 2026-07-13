@@ -27,6 +27,10 @@ CCC             := $(CCC_DIR)/target/release/ccc-x86
 ARCH            := x86_64
 CROSS_COMPILE   :=
 
+# ── Opciones de patches ──────────────────────────────────────────────────────
+# Bigscreen Beyond / Beyond 2: default on. Desactivar con RUSTLUX_BSB=no
+RUSTLUX_BSB     ?= yes
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 KERNEL_DIR      := kernel/$(KERNEL_NAME)
 BUILD_DIR       := build
@@ -100,6 +104,17 @@ kernel-patch: $(KERNEL_DIR)
 	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0006-rustlux-perf-hook.patch
 	@echo "==> Aplicando patch rustlux tiocsti hook..."
 	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0007-rustlux-tiocsti-hook.patch
+	@echo "==> Aplicando patch rustlux mem sentinel..."
+	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0008-rustlux-mem-sentinel.patch
+	@echo "==> Aplicando patch rustlux soft-ECC..."
+	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0009-rustlux-soft-ecc.patch
+ifeq ($(RUSTLUX_BSB),yes)
+	@echo "==> Aplicando patches Bigscreen Beyond (desactivar con RUSTLUX_BSB=no)..."
+	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0010-bsb-beyond-display.patch
+	cd $(KERNEL_DIR) && patch -p1 < ../../$(PATCHES_DIR)/0011-bsb-amd-dsc-fix.patch
+else
+	@echo "==> Patches Bigscreen Beyond: omitidos (RUSTLUX_BSB=no)"
+endif
 	@echo "==> Patches aplicados."
 
 kernel-config: $(KERNEL_DIR)

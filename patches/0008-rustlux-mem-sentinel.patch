@@ -1,0 +1,249 @@
+diff -ruN a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@ -46,6 +46,7 @@
+ #include <linux/hardirq.h>
+ #include <linux/kexec.h>
+ #include <linux/vmcore_info.h>
++#include <linux/rustlux_memsentinel.h>
+ 
+ #include <asm/fred.h>
+ #include <asm/cpu_device_id.h>
+@@ -152,6 +153,14 @@
+ 
+ void mce_log(struct mce_hw_err *err)
+ {
++	/*
++	 * Rustlux memory sentinel: feed every logged machine check into
++	 * the DRAM instability detector. Errors sourced from the memory
++	 * controller (UMC on AMD, IMC on Intel) are the earliest visible
++	 * symptom of an unstable EXPO/XMP profile.
++	 */
++	rustlux_memsentinel_record(&err->m);
++
+ 	if (mce_gen_pool_add(err))
+ 		irq_work_queue(&mce_irq_work);
+ }
+diff -ruN a/include/linux/rustlux_memsentinel.h b/include/linux/rustlux_memsentinel.h
+--- a/include/linux/rustlux_memsentinel.h
++++ b/include/linux/rustlux_memsentinel.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * rustlux_memsentinel.h — DRAM instability detector for Rustlux
++ * Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
++ *
++ * THEORY OF OPERATION
++ *
++ * The kernel cannot make unstable DRAM stable: memory frequency and
++ * timings are programmed by firmware (AGESA / MRC) during memory
++ * training, before the kernel boots, and cannot be reprogrammed at
++ * runtime. What the kernel CAN do is:
++ *
++ *   1. Detect the symptom. An unstable EXPO/XMP profile produces
++ *      machine-check errors sourced from the memory controller
++ *      (corrected at first, uncorrected when it is about to crash).
++ *   2. Warn loudly with actionable guidance (lower MT/s, raise
++ *      VSOC/VDDQ, retrain) BEFORE silent corruption becomes a panic.
++ *   3. Contain the blast radius: queue pages with uncorrected errors
++ *      for memory_failure() handling, so a marginal DIMM degrades
++ *      service instead of taking down the whole machine.
++ *
++ * Sysctls:
++ *   vm.rustlux_memsentinel            (0/1, default 1)
++ *   vm.rustlux_memsentinel_threshold  (corrected errors per 60s
++ *                                      window before warning,
++ *                                      default 8)
++ */
++#ifndef _LINUX_RUSTLUX_MEMSENTINEL_H
++#define _LINUX_RUSTLUX_MEMSENTINEL_H
++
++#include <linux/types.h>
++
++struct mce;
++
++/* Actions decided by the (Rust or C) rate-tracking core */
++#define RUSTLUX_MS_ACTION_NONE		0
++#define RUSTLUX_MS_ACTION_WARN		1
++#define RUSTLUX_MS_ACTION_OFFLINE	2
++
++#ifdef CONFIG_X86_MCE
++
++/**
++ * rustlux_memsentinel_record - feed a machine check into the sentinel
++ * @m: the logged machine check record (&mce_hw_err.m from mce_log())
++ *
++ * Called from mce_log(). Ignores anything that is not a memory
++ * error. Safe to call from MCE context: the decision core is
++ * lock-free (atomics only) and the containment work is deferred
++ * through memory_failure_queue().
++ */
++void rustlux_memsentinel_record(struct mce *m);
++
++#else /* !CONFIG_X86_MCE */
++
++static inline void rustlux_memsentinel_record(struct mce *m) { }
++
++#endif /* CONFIG_X86_MCE */
++
++#endif /* _LINUX_RUSTLUX_MEMSENTINEL_H */
+diff -ruN a/mm/Makefile b/mm/Makefile
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -150,3 +150,4 @@
+ obj-$(CONFIG_EXECMEM) += execmem.o
+ obj-$(CONFIG_TMPFS_QUOTA) += shmem_quota.o
+ obj-$(CONFIG_LAZY_MMU_MODE_KUNIT_TEST) += tests/lazy_mmu_mode_kunit.o
++obj-$(CONFIG_X86_MCE) += rustlux_memsentinel.o
+diff -ruN a/mm/rustlux_memsentinel.c b/mm/rustlux_memsentinel.c
+--- a/mm/rustlux_memsentinel.c
++++ b/mm/rustlux_memsentinel.c
+@@ -0,0 +1,148 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * rustlux_memsentinel.c — DRAM instability detector
++ * Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
++ *
++ * See include/linux/rustlux_memsentinel.h for the theory of operation.
++ *
++ * When CONFIG_RUST is enabled the sliding-window decision core lives
++ * in rust/kernel/rustlux.rs (rustlux_memsentinel_on_error), mirrored
++ * by the standalone crate rust/rustlux_mm/src/mem_sentinel.rs.
++ * Otherwise an equivalent C implementation is used.
++ */
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/sysctl.h>
++#include <linux/ktime.h>
++#include <linux/atomic.h>
++#include <linux/panic.h>
++#include <linux/rustlux_memsentinel.h>
++
++#include <asm/mce.h>
++
++static int sysctl_memsentinel_enabled = 1;
++static unsigned int sysctl_memsentinel_threshold = 8;
++
++#define RUSTLUX_MS_WINDOW_MS	60000ULL
++
++#ifdef CONFIG_RUST
++
++/* Rust implementation in rust/kernel/rustlux.rs */
++extern int rustlux_memsentinel_on_error(u64 now_ms, u8 uncorrected,
++					u32 threshold);
++
++#else /* !CONFIG_RUST */
++
++static atomic64_t ms_window_start_ms;
++static atomic_t ms_window_count;
++
++/*
++ * C fallback — same logic as the Rust core. Lock-free fixed window:
++ * count corrected memory errors; when the count inside one window
++ * crosses the threshold, escalate to WARN. Uncorrected errors always
++ * escalate to OFFLINE immediately.
++ */
++static int rustlux_memsentinel_on_error(u64 now_ms, u8 uncorrected,
++					u32 threshold)
++{
++	u64 start;
++	int count;
++
++	if (uncorrected)
++		return RUSTLUX_MS_ACTION_OFFLINE;
++
++	start = atomic64_read(&ms_window_start_ms);
++	if (now_ms - start > RUSTLUX_MS_WINDOW_MS) {
++		/* new window; only one CPU wins the reset */
++		if (atomic64_cmpxchg(&ms_window_start_ms, start,
++				     now_ms) == start)
++			atomic_set(&ms_window_count, 0);
++	}
++
++	count = atomic_inc_return(&ms_window_count);
++	if (count == (int)threshold)
++		return RUSTLUX_MS_ACTION_WARN;
++
++	return RUSTLUX_MS_ACTION_NONE;
++}
++
++#endif /* CONFIG_RUST */
++
++void rustlux_memsentinel_record(struct mce *m)
++{
++	u64 now_ms;
++	int action;
++	u8 uncorrected;
++
++	if (!READ_ONCE(sysctl_memsentinel_enabled))
++		return;
++
++	if (!(m->status & MCI_STATUS_VAL))
++		return;
++
++	/*
++	 * Only errors sourced from the memory hierarchy are relevant:
++	 * on AMD these come from the UMC banks, on Intel from the IMC.
++	 * mce_is_memory_error() decodes MCACOD for both vendors.
++	 */
++	if (!mce_is_memory_error(m))
++		return;
++
++	uncorrected = (m->status & MCI_STATUS_UC) ? 1 : 0;
++	now_ms = ktime_get_boottime_ns() / NSEC_PER_MSEC;
++
++	action = rustlux_memsentinel_on_error(now_ms, uncorrected,
++				READ_ONCE(sysctl_memsentinel_threshold));
++
++	switch (action) {
++	case RUSTLUX_MS_ACTION_WARN:
++		pr_crit("rustlux_memsentinel: %u corrected memory errors within %llus — DRAM is likely UNSTABLE at the current frequency.\n",
++			READ_ONCE(sysctl_memsentinel_threshold),
++			RUSTLUX_MS_WINDOW_MS / 1000);
++		pr_crit("rustlux_memsentinel: this is a hardware/firmware condition the kernel cannot fix. Suggested: lower the EXPO/XMP frequency one step, raise VSOC/VDDQ within safe limits, update BIOS/AGESA, or run memtest86+. Expect silent data corruption until resolved.\n");
++		add_taint(TAINT_MACHINE_CHECK, LOCKDEP_STILL_OK);
++		break;
++
++	case RUSTLUX_MS_ACTION_OFFLINE:
++		/*
++		 * Uncorrected error: if the record carries a usable
++		 * address, hand the page to hwpoison so the affected
++		 * process is killed / page unmapped instead of letting
++		 * corrupted data propagate. memory_failure_queue() is
++		 * safe from this context (irq_work + workqueue).
++		 */
++		if (m->status & MCI_STATUS_ADDRV)
++			memory_failure_queue(m->addr >> PAGE_SHIFT, 0);
++		break;
++
++	default:
++		break;
++	}
++}
++
++static const struct ctl_table rustlux_memsentinel_sysctls[] = {
++	{
++		.procname	= "rustlux_memsentinel",
++		.data		= &sysctl_memsentinel_enabled,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "rustlux_memsentinel_threshold",
++		.data		= &sysctl_memsentinel_threshold,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ONE,
++	},
++};
++
++static int __init rustlux_memsentinel_init(void)
++{
++	register_sysctl_init("vm", rustlux_memsentinel_sysctls);
++	return 0;
++}
++late_initcall(rustlux_memsentinel_init);

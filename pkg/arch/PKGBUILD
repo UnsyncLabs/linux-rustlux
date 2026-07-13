@@ -9,6 +9,8 @@
 #   _processor_opt=zen4 makepkg -si      # Optimizado para Zen4
 #   _build_zfs=yes makepkg -si           # Con modulo ZFS
 #   _build_nvidia_open=yes makepkg -si   # Con modulo NVIDIA open
+#   _hardened=no makepkg -si             # Sin hardened (patch + config)
+#   _bigscreen_beyond=no makepkg -si     # Sin parches Bigscreen Beyond
 
 ### ═══════════════════════════════════════════════════════════════════════════
 ### BUILD OPTIONS — override con variables de entorno o editar aqui
@@ -63,6 +65,19 @@
 # "yes" = BBR3 como default
 # "no"  = CUBIC (default del kernel)
 : "${_tcp_bbr3:=no}"
+
+## Hardened
+# "yes" = aplica 0001-hardened.patch + config de hardening (default)
+# "no"  = kernel sin hardened (mas compatibilidad/rendimiento,
+#         menos mitigaciones; los guards Rustlux 0004-0009 se aplican igual)
+: "${_hardened:=yes}"
+
+## Bigscreen Beyond / Beyond 2 (VR)
+# "yes" = parches DRM/EDID + amdgpu DSC para que el headset funcione (default)
+# "no"  = kernel sin los parches BSB
+# Nota NVIDIA: el fix DSC para NVIDIA (patches/nvidia/nvidia-bsb-dsc-fix.patch)
+# aplica al arbol de los modulos NVIDIA open (DKMS), no a este kernel.
+: "${_bigscreen_beyond:=yes}"
 
 ## Modulos extra
 : "${_build_zfs:=no}"
@@ -163,8 +178,12 @@ prepare() {
     echo "-${pkgrel}-${_pkgsuffix}" > localversion.10-pkgrel
 
     # ── Patches ──────────────────────────────────────────────────────────────
-    echo "Applying hardened patch..."
-    patch -Np1 --forward -i "${_patchdir}/0001-hardened.patch" || true
+    if [ "$_hardened" = "yes" ]; then
+        echo "Applying hardened patch..."
+        patch -Np1 --forward -i "${_patchdir}/0001-hardened.patch" || true
+    else
+        echo "Hardened patch: SKIPPED (_hardened=no)"
+    fi
 
     echo "Applying BORE scheduler patch..."
     patch -Np1 -i "${_patchdir}/0002-bore-cachy.patch"
@@ -185,6 +204,21 @@ prepare() {
 
     echo "Applying Rustlux tiocsti hook..."
     patch -Np1 -i "${_patchdir}/0007-rustlux-tiocsti-hook.patch"
+
+    echo "Applying Rustlux mem sentinel (DRAM instability detector)..."
+    patch -Np1 -i "${_patchdir}/0008-rustlux-mem-sentinel.patch"
+
+    echo "Applying Rustlux soft-ECC (critical structure scrubbing)..."
+    patch -Np1 -i "${_patchdir}/0009-rustlux-soft-ecc.patch"
+
+    if [ "$_bigscreen_beyond" = "yes" ]; then
+        echo "Applying Bigscreen Beyond display support (DRM/EDID DSC bpp)..."
+        patch -Np1 -i "${_patchdir}/0010-bsb-beyond-display.patch"
+        echo "Applying Bigscreen Beyond AMD DSC fix (rainbow static)..."
+        patch -Np1 -i "${_patchdir}/0011-bsb-amd-dsc-fix.patch"
+    else
+        echo "Bigscreen Beyond patches: SKIPPED (_bigscreen_beyond=no)"
+    fi
 
     # ── Config base ──────────────────────────────────────────────────────────
     echo "Setting config..."
@@ -285,9 +319,14 @@ prepare() {
     fi
 
     # ── Hardening (Rustlux defaults) ─────────────────────────────────────────
-    scripts/config -e SECURITY_YAMA -e HARDENED_USERCOPY -e FORTIFY_SOURCE \
-        -e INIT_ON_ALLOC_DEFAULT_ON -e RANDOMIZE_KSTACK_OFFSET_DEFAULT \
-        -e PAGE_TABLE_ISOLATION
+    if [ "$_hardened" = "yes" ]; then
+        scripts/config -e SECURITY_YAMA -e HARDENED_USERCOPY -e FORTIFY_SOURCE \
+            -e INIT_ON_ALLOC_DEFAULT_ON -e RANDOMIZE_KSTACK_OFFSET_DEFAULT \
+            -e PAGE_TABLE_ISOLATION
+        echo "Hardening config: enabled"
+    else
+        echo "Hardening config: SKIPPED (_hardened=no)"
+    fi
 
     # ── ZFS requirements ─────────────────────────────────────────────────────
     if [ "$_build_zfs" = "yes" ]; then

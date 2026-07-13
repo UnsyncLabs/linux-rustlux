@@ -11,7 +11,7 @@ diff -ruN a/fs/splice.c b/fs/splice.c
  
 @@ -931,6 +932,17 @@
  static ssize_t do_splice_from(struct pipe_inode_info *pipe, struct file *out,
-                               loff_t *ppos, size_t len, unsigned int flags)
+ 			      loff_t *ppos, size_t len, unsigned int flags)
  {
 +	/*
 +	 * Rustlux splice guard: verify write permission to page cache

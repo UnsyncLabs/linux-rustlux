@@ -1,0 +1,449 @@
+diff -ruN a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -3,6 +3,7 @@
+  * Interrupt descriptor table related code
+  */
+ #include <linux/interrupt.h>
++#include <linux/rustlux_softecc.h>
+ 
+ #include <asm/cpu_entry_area.h>
+ #include <asm/set_memory.h>
+@@ -314,6 +315,14 @@
+ 	/* Make the IDT table read only */
+ 	set_memory_ro((unsigned long)&idt_table, 1);
+ 
++	/*
++	 * The IDT layout is final and read-only from here on: register
++	 * it with the Rustlux soft-ECC scrubber so a DRAM bit flip in a
++	 * gate descriptor (or a rowhammer-induced one) is corrected
++	 * instead of redirecting an exception into garbage.
++	 */
++	rustlux_softecc_protect("idt", idt_table, sizeof(idt_table), true);
++
+ 	idt_setup_done = true;
+ }
+ 
+diff -ruN a/include/linux/rustlux_softecc.h b/include/linux/rustlux_softecc.h
+--- a/include/linux/rustlux_softecc.h
++++ b/include/linux/rustlux_softecc.h
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * rustlux_softecc.h — software SECDED for critical kernel structures
++ * Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
++ *
++ * THEORY OF OPERATION
++ *
++ * Consumer hardware has no host-visible ECC: a DRAM bit flip in a
++ * kernel structure is silent until it becomes a crash (or a rowhammer
++ * privilege escalation). True per-access ECC is impossible in
++ * software — we cannot intercept every load — but *periodic
++ * scrub-and-correct* of a small, high-value set of structures is
++ * practical and is how space-grade systems have protected RAM from
++ * radiation-induced flips for decades.
++ *
++ * Each protected region keeps a shadow array of 8-bit SECDED codes,
++ * one per 64-bit word (Hamming(72,64): 12.5% memory overhead on the
++ * protected region only). A scrubber runs every
++ * vm.rustlux_softecc_interval_ms and for every word:
++ *
++ *   - clean                → nothing
++ *   - single-bit flip      → CORRECTED in place, pr_warn with the
++ *                            physical address (feeds the mem sentinel
++ *                            picture of DRAM health)
++ *   - double-bit flip      → uncorrectable: pr_alert + taint. The
++ *                            admin knows the machine is lying to it.
++ *
++ * Protected at boot (stable after init, so no write coordination):
++ *   - the __ro_after_init section (registered from this file's init)
++ *   - the IDT (registered from arch/x86/kernel/idt.c once its layout
++ *     is final and it has been set read-only)
++ *
++ * Mutable structures (page tables, creds) need write-path hooks to
++ * reseal on legitimate modification — future work. The reseal API
++ * below is the entry point for that.
++ *
++ * The encode/verify core lives in rust/kernel/rustlux.rs when
++ * CONFIG_RUST=y (mirrored by the standalone crate
++ * rust/rustlux_mm/src/soft_ecc.rs), with an equivalent C fallback.
++ *
++ * LIMITS (honest ones):
++ *   - There is a window between the flip and the next scrub pass in
++ *     which the corrupted value can be consumed. This shrinks MTTR,
++ *     it is not per-access ECC.
++ *   - Only whole 64-bit words are protected; a region's trailing
++ *     sub-word bytes are left uncovered.
++ *   - Corrections to read-only mappings toggle page permissions
++ *     (set_memory_rw/ro), which briefly widens the write window on
++ *     that page.
++ */
++#ifndef _LINUX_RUSTLUX_SOFTECC_H
++#define _LINUX_RUSTLUX_SOFTECC_H
++
++#include <linux/types.h>
++
++/* result of verifying one word */
++#define RUSTLUX_SECC_CLEAN		0
++#define RUSTLUX_SECC_CORRECTED		1
++#define RUSTLUX_SECC_UNCORRECTABLE	-1
++
++#ifdef CONFIG_RUSTLUX_SOFTECC
++
++/**
++ * rustlux_softecc_protect - start scrubbing a memory region
++ * @name:     label used in log messages
++ * @addr:     start of the region (8-byte aligned)
++ * @size:     region size in bytes (protected: size / 8 words)
++ * @readonly: region is mapped RO; corrections must toggle page perms
++ *
++ * Computes the shadow SECDED codes and registers the region with the
++ * scrubber. Returns 0 or -ENOMEM.
++ */
++int rustlux_softecc_protect(const char *name, void *addr, size_t size,
++			    bool readonly);
++
++/**
++ * rustlux_softecc_reseal - recompute codes after a legitimate write
++ * @addr: start address previously passed to rustlux_softecc_protect()
++ *
++ * Must be called by any code path that intentionally modifies a
++ * protected region, otherwise the scrubber will "correct" the new
++ * value back to the old one.
++ */
++void rustlux_softecc_reseal(void *addr);
++
++#else /* !CONFIG_RUSTLUX_SOFTECC */
++
++static inline int rustlux_softecc_protect(const char *name, void *addr,
++					  size_t size, bool readonly)
++{
++	return 0;
++}
++static inline void rustlux_softecc_reseal(void *addr) { }
++
++#endif /* CONFIG_RUSTLUX_SOFTECC */
++
++#endif /* _LINUX_RUSTLUX_SOFTECC_H */
+diff -ruN a/mm/Kconfig b/mm/Kconfig
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1449,6 +1449,22 @@
+ 
+ 	  Note: now only empty user PTE page table pages will be reclaimed.
+ 
++config RUSTLUX_SOFTECC
++	bool "Rustlux software SECDED for critical kernel structures"
++	depends on X86_64
++	default y
++	help
++	  Keeps Hamming(72,64) SECDED codes for a small set of critical
++	  kernel structures (__ro_after_init section, IDT) and scrubs
++	  them periodically, correcting single-bit DRAM flips in place
++	  and reporting uncorrectable ones. Intended for machines
++	  without host-visible ECC running marginal memory (aggressive
++	  EXPO/XMP profiles), and as a rowhammer mitigation for
++	  attacker-induced flips in kernel data.
++
++	  Memory overhead is 12.5% of the protected regions (a few
++	  KiB). If unsure, say Y.
++
+ config FIND_NORMAL_PAGE
+ 	def_bool n
+ 
+diff -ruN a/mm/Makefile b/mm/Makefile
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -151,3 +151,4 @@
+ obj-$(CONFIG_TMPFS_QUOTA) += shmem_quota.o
+ obj-$(CONFIG_LAZY_MMU_MODE_KUNIT_TEST) += tests/lazy_mmu_mode_kunit.o
+ obj-$(CONFIG_X86_MCE) += rustlux_memsentinel.o
++obj-$(CONFIG_RUSTLUX_SOFTECC) += rustlux_softecc.o
+diff -ruN a/mm/rustlux_softecc.c b/mm/rustlux_softecc.c
+--- a/mm/rustlux_softecc.c
++++ b/mm/rustlux_softecc.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * rustlux_softecc.c — software SECDED scrubber
++ * Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
++ *
++ * See include/linux/rustlux_softecc.h for the theory of operation.
++ */
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++#include <linux/jiffies.h>
++#include <linux/sysctl.h>
++#include <linux/panic.h>
++#include <linux/mutex.h>
++#include <linux/set_memory.h>
++#include <linux/mm.h>
++#include <linux/io.h>
++#include <linux/rustlux_softecc.h>
++
++#include <asm/sections.h>
++
++static int sysctl_softecc_enabled = 1;
++static unsigned int sysctl_softecc_interval_ms = 2000;
++
++static LIST_HEAD(softecc_regions);
++static DEFINE_MUTEX(softecc_lock);
++static atomic64_t softecc_corrected = ATOMIC64_INIT(0);
++static atomic64_t softecc_uncorrectable = ATOMIC64_INIT(0);
++
++struct softecc_region {
++	struct list_head list;
++	const char *name;
++	u64 *addr;
++	size_t words;
++	u8 *codes;
++	bool readonly;
++};
++
++struct rustlux_secc_result {
++	s32 status;	/* RUSTLUX_SECC_* */
++	u64 data;	/* corrected word when status == CORRECTED */
++};
++
++#ifdef CONFIG_RUST
++
++/* Rust implementation in rust/kernel/rustlux.rs */
++extern u8 rustlux_softecc_encode(u64 data);
++extern struct rustlux_secc_result rustlux_softecc_verify(u64 data, u8 code);
++
++#else /* !CONFIG_RUST */
++
++/*
++ * C fallback — Hamming(72,64) SECDED, same construction as the Rust
++ * core: 71 codeword positions (1..71), parity bits at the powers of
++ * two, data bits filling the rest in order, plus one overall parity
++ * bit (bit 7 of the code byte) to tell single from double errors.
++ */
++#define SECC_POSITIONS	71
++
++static inline bool secc_is_parity_pos(u32 pos)
++{
++	return (pos & (pos - 1)) == 0;
++}
++
++static u32 secc_data_syndrome(u64 data)
++{
++	u32 syn = 0, bit = 0, pos;
++
++	for (pos = 1; pos <= SECC_POSITIONS; pos++) {
++		if (secc_is_parity_pos(pos))
++			continue;
++		if ((data >> bit) & 1)
++			syn ^= pos;
++		bit++;
++	}
++	return syn;
++}
++
++static u8 rustlux_softecc_encode(u64 data)
++{
++	u8 code = secc_data_syndrome(data) & 0x7f;
++
++	if ((hweight64(data) + hweight8(code)) & 1)
++		code |= 0x80;
++	return code;
++}
++
++static struct rustlux_secc_result rustlux_softecc_verify(u64 data, u8 code)
++{
++	struct rustlux_secc_result r = {
++		.status = RUSTLUX_SECC_CLEAN,
++		.data = data,
++	};
++	u32 syn = secc_data_syndrome(data) ^ (code & 0x7f);
++	bool parity_ok = !((hweight64(data) + hweight8(code)) & 1);
++	u32 pos, bit = 0;
++
++	if (!syn && parity_ok)
++		return r;
++
++	if (!syn && !parity_ok) {
++		/* the overall parity bit itself flipped; data intact */
++		r.status = RUSTLUX_SECC_CORRECTED;
++		return r;
++	}
++
++	if (syn && parity_ok) {
++		/* even number of flips: beyond SECDED */
++		r.status = RUSTLUX_SECC_UNCORRECTABLE;
++		return r;
++	}
++
++	/* single-bit error at codeword position syn */
++	if (syn > SECC_POSITIONS) {
++		r.status = RUSTLUX_SECC_UNCORRECTABLE;
++		return r;
++	}
++	if (secc_is_parity_pos(syn)) {
++		/* a shadow parity bit flipped; data intact */
++		r.status = RUSTLUX_SECC_CORRECTED;
++		return r;
++	}
++	for (pos = 1; pos < syn; pos++)
++		if (!secc_is_parity_pos(pos))
++			bit++;
++	r.data = data ^ BIT_ULL(bit);
++	r.status = RUSTLUX_SECC_CORRECTED;
++	return r;
++}
++
++#endif /* CONFIG_RUST */
++
++static void softecc_fix_word(struct softecc_region *r, size_t i, u64 good)
++{
++	unsigned long page = (unsigned long)&r->addr[i] & PAGE_MASK;
++
++	if (r->readonly)
++		set_memory_rw(page, 1);
++	WRITE_ONCE(r->addr[i], good);
++	if (r->readonly)
++		set_memory_ro(page, 1);
++}
++
++static void softecc_scrub_region(struct softecc_region *r)
++{
++	size_t i;
++
++	for (i = 0; i < r->words; i++) {
++		u64 word = READ_ONCE(r->addr[i]);
++		struct rustlux_secc_result res =
++			rustlux_softecc_verify(word, r->codes[i]);
++		phys_addr_t phys;
++
++		switch (res.status) {
++		case RUSTLUX_SECC_CORRECTED:
++			softecc_fix_word(r, i, res.data);
++			r->codes[i] = rustlux_softecc_encode(res.data);
++			atomic64_inc(&softecc_corrected);
++			phys = virt_to_phys(&r->addr[i]);
++			pr_warn("rustlux_softecc: corrected single-bit flip in %s at %px (phys %pa) — DRAM produced a real error, check EXPO/XMP stability\n",
++				r->name, &r->addr[i], &phys);
++			break;
++
++		case RUSTLUX_SECC_UNCORRECTABLE:
++			atomic64_inc(&softecc_uncorrectable);
++			pr_alert("rustlux_softecc: UNCORRECTABLE multi-bit corruption in %s at %px — kernel state is not trustworthy\n",
++				 r->name, &r->addr[i]);
++			add_taint(TAINT_MACHINE_CHECK, LOCKDEP_STILL_OK);
++			/* reseal so we report each event once */
++			r->codes[i] = rustlux_softecc_encode(word);
++			break;
++
++		default:
++			break;
++		}
++	}
++}
++
++static void softecc_scrub_fn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(softecc_work, softecc_scrub_fn);
++
++static void softecc_scrub_fn(struct work_struct *work)
++{
++	struct softecc_region *r;
++
++	if (READ_ONCE(sysctl_softecc_enabled)) {
++		mutex_lock(&softecc_lock);
++		list_for_each_entry(r, &softecc_regions, list)
++			softecc_scrub_region(r);
++		mutex_unlock(&softecc_lock);
++	}
++
++	schedule_delayed_work(&softecc_work,
++		msecs_to_jiffies(READ_ONCE(sysctl_softecc_interval_ms)));
++}
++
++int rustlux_softecc_protect(const char *name, void *addr, size_t size,
++			    bool readonly)
++{
++	struct softecc_region *r;
++	size_t i;
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++
++	r->name = name;
++	r->addr = addr;
++	r->words = size / sizeof(u64);
++	r->readonly = readonly;
++	r->codes = kvmalloc(r->words, GFP_KERNEL);
++	if (!r->codes) {
++		kfree(r);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < r->words; i++)
++		r->codes[i] = rustlux_softecc_encode(READ_ONCE(r->addr[i]));
++
++	mutex_lock(&softecc_lock);
++	list_add_tail(&r->list, &softecc_regions);
++	mutex_unlock(&softecc_lock);
++
++	pr_info("rustlux_softecc: protecting %s (%zu KiB, %zu words)\n",
++		name, size >> 10, r->words);
++	return 0;
++}
++
++void rustlux_softecc_reseal(void *addr)
++{
++	struct softecc_region *r;
++	size_t i;
++
++	mutex_lock(&softecc_lock);
++	list_for_each_entry(r, &softecc_regions, list) {
++		if (r->addr != addr)
++			continue;
++		for (i = 0; i < r->words; i++)
++			r->codes[i] =
++				rustlux_softecc_encode(READ_ONCE(r->addr[i]));
++		break;
++	}
++	mutex_unlock(&softecc_lock);
++}
++
++static const struct ctl_table rustlux_softecc_sysctls[] = {
++	{
++		.procname	= "rustlux_softecc",
++		.data		= &sysctl_softecc_enabled,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "rustlux_softecc_interval_ms",
++		.data		= &sysctl_softecc_interval_ms,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ONE_HUNDRED,
++	},
++};
++
++static int __init rustlux_softecc_init(void)
++{
++	/*
++	 * Stable-after-init structures only, so no reseal coordination
++	 * is needed. The IDT registers itself from
++	 * arch/x86/kernel/idt.c; page tables and creds need write-path
++	 * hooks — future work (see header).
++	 */
++	rustlux_softecc_protect("ro_after_init", __start_ro_after_init,
++				__end_ro_after_init - __start_ro_after_init,
++				true);
++
++	register_sysctl_init("vm", rustlux_softecc_sysctls);
++	schedule_delayed_work(&softecc_work,
++		msecs_to_jiffies(sysctl_softecc_interval_ms));
++	return 0;
++}
++late_initcall(rustlux_softecc_init);

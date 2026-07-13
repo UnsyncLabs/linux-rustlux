@@ -1,7 +1,18 @@
+diff -ruN a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -140,6 +140,7 @@
+ pub mod rbtree;
+ pub mod regulator;
+ pub mod revocable;
++pub mod rustlux;
+ pub mod safety;
+ pub mod scatterlist;
+ pub mod security;
 diff -ruN a/rust/kernel/rustlux.rs b/rust/kernel/rustlux.rs
 --- a/rust/kernel/rustlux.rs
 +++ b/rust/kernel/rustlux.rs
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,269 @@
 +// SPDX-License-Identifier: GPL-2.0
 +// Copyright (C) 2026 Yadiel Abner Rodriguez Jorge (neokuze) <imneokuze@gmail.com>
 +
@@ -110,13 +121,164 @@ diff -ruN a/rust/kernel/rustlux.rs b/rust/kernel/rustlux.rs
 +        0
 +    }
 +}
-diff -ruN a/rust/kernel/lib.rs b/rust/kernel/lib.rs
---- a/rust/kernel/lib.rs
-+++ b/rust/kernel/lib.rs
-@@ -142,6 +142,7 @@
- pub mod regulator;
- pub mod revocable;
-+pub mod rustlux;
- pub mod safety;
- pub mod scatterlist;
- pub mod security;
++
++// ─── Memory sentinel (patch 0008) ────────────────────────────────────────────
++//
++// Lock-free fixed-window rate tracker for machine-check errors sourced
++// from the memory controller. Mirrored by the standalone crate
++// rust/rustlux_mm/src/mem_sentinel.rs (where the unit tests live).
++
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++
++/// Sliding window for corrected-error accounting, in milliseconds.
++const MS_WINDOW_MS: u64 = 60_000;
++
++static MS_WINDOW_START: AtomicU64 = AtomicU64::new(0);
++static MS_WINDOW_COUNT: AtomicU32 = AtomicU32::new(0);
++
++/// Classify one memory error into an action for the C side.
++///
++/// Called from `rustlux_memsentinel_record()` in mm/rustlux_memsentinel.c.
++/// Safe from MCE context: atomics only, no locks, no allocation.
++///
++/// # Arguments
++/// * `now_ms` - boottime timestamp of the error, in milliseconds
++/// * `uncorrected` - 1 if the error was uncorrected (MCI_STATUS_UC)
++/// * `threshold` - corrected errors per window before warning
++///
++/// # Returns
++/// * 0 (`RUSTLUX_MS_ACTION_NONE`) - corrected error below threshold
++/// * 1 (`RUSTLUX_MS_ACTION_WARN`) - corrected-error storm: DRAM unstable
++/// * 2 (`RUSTLUX_MS_ACTION_OFFLINE`) - uncorrected: queue page to hwpoison
++#[no_mangle]
++pub extern "C" fn rustlux_memsentinel_on_error(now_ms: u64, uncorrected: u8, threshold: u32) -> i32 {
++    const ACTION_NONE: i32 = 0;
++    const ACTION_WARN: i32 = 1;
++    const ACTION_OFFLINE: i32 = 2;
++
++    if uncorrected != 0 {
++        return ACTION_OFFLINE;
++    }
++
++    let start = MS_WINDOW_START.load(Ordering::Relaxed);
++    if now_ms.wrapping_sub(start) > MS_WINDOW_MS {
++        // new window; only one CPU wins the reset
++        if MS_WINDOW_START
++            .compare_exchange(start, now_ms, Ordering::Relaxed, Ordering::Relaxed)
++            .is_ok()
++        {
++            MS_WINDOW_COUNT.store(0, Ordering::Relaxed);
++        }
++    }
++
++    let count = MS_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
++    if count == threshold.max(1) {
++        ACTION_WARN
++    } else {
++        ACTION_NONE
++    }
++}
++
++// ─── Soft-ECC (patch 0009) ───────────────────────────────────────────────────
++//
++// Hamming(72,64) SECDED core: 71 codeword positions (1..=71), parity
++// bits at the powers of two, the 64 data bits filling the rest in
++// order, plus one overall-parity bit (bit 7 of the code byte) to tell
++// single flips from double flips. Pure functions, no state. Mirrored
++// by rust/rustlux_mm/src/soft_ecc.rs (where the unit tests live).
++
++/// Number of positional codeword bits (64 data + 7 parity).
++const SECC_POSITIONS: u32 = 71;
++
++/// FFI result of verifying one protected word.
++///
++/// Layout matches `struct rustlux_secc_result` in mm/rustlux_softecc.c.
++#[repr(C)]
++pub struct SoftEccResult {
++    /// 0 = clean, 1 = corrected, -1 = uncorrectable.
++    pub status: i32,
++    /// Corrected data word (valid when `status` == 1).
++    pub data: u64,
++}
++
++fn secc_is_parity_pos(pos: u32) -> bool {
++    pos & (pos - 1) == 0
++}
++
++/// XOR of the codeword positions of every set data bit.
++fn secc_data_syndrome(data: u64) -> u32 {
++    let mut syn = 0u32;
++    let mut bit = 0u32;
++    for pos in 1..=SECC_POSITIONS {
++        if secc_is_parity_pos(pos) {
++            continue;
++        }
++        if (data >> bit) & 1 == 1 {
++            syn ^= pos;
++        }
++        bit += 1;
++    }
++    syn
++}
++
++/// Compute the 8-bit SECDED code for a 64-bit word.
++///
++/// Called from mm/rustlux_softecc.c when sealing a protected region.
++#[no_mangle]
++pub extern "C" fn rustlux_softecc_encode(data: u64) -> u8 {
++    // parity bit i (position 2^i) must cancel bit i of the data
++    // syndrome, so the low 7 bits of the code ARE the syndrome
++    let mut code = (secc_data_syndrome(data) & 0x7f) as u8;
++
++    // overall parity over data + positional parity bits, stored so
++    // the total number of ones (including this bit) is even
++    if (data.count_ones() + (code as u32).count_ones()) & 1 == 1 {
++        code |= 0x80;
++    }
++    code
++}
++
++/// Verify a word against its code, correcting single-bit flips.
++///
++/// Called from the scrubber in mm/rustlux_softecc.c for every word of
++/// every protected region.
++///
++/// # Returns
++/// `SoftEccResult` with:
++/// * `status` 0 - word and code are consistent
++/// * `status` 1 - exactly one bit flipped; `data` holds the corrected word
++/// * `status` -1 - two or more bits flipped: beyond SECDED, data is lost
++#[no_mangle]
++pub extern "C" fn rustlux_softecc_verify(data: u64, code: u8) -> SoftEccResult {
++    // XOR of distinct powers of two == the integer value of the low
++    // 7 code bits, so the parity contribution to the syndrome is just
++    // (code & 0x7f)
++    let syn = secc_data_syndrome(data) ^ (code & 0x7f) as u32;
++    let parity_ok = (data.count_ones() + (code as u32).count_ones()) & 1 == 0;
++
++    match (syn, parity_ok) {
++        (0, true) => SoftEccResult { status: 0, data },
++        // only the overall parity bit flipped; data intact
++        (0, false) => SoftEccResult { status: 1, data },
++        // an even number of flips keeps overall parity: beyond SECDED
++        (_, true) => SoftEccResult { status: -1, data },
++        (pos, false) => {
++            if pos > SECC_POSITIONS {
++                // impossible position: multi-bit corruption
++                SoftEccResult { status: -1, data }
++            } else if secc_is_parity_pos(pos) {
++                // a shadow parity bit flipped; data intact
++                SoftEccResult { status: 1, data }
++            } else {
++                // map the codeword position back to its data bit index
++                let mut bit = 0u32;
++                for p in 1..pos {
++                    if !secc_is_parity_pos(p) {
++                        bit += 1;
++                    }
++                }
++                SoftEccResult { status: 1, data: data ^ (1u64 << bit) }
++            }
++        }
++    }
++}

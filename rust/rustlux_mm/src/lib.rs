@@ -13,9 +13,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+/// DRAM instability detector — decision core for the memory sentinel.
+pub mod mem_sentinel;
 /// Page cache write protection — eliminates Dirty Pipe/Copy Fail/Dirty Frag class.
 pub mod page_cache;
 /// Read-only after init — Rust equivalent of __ro_after_init.
 pub mod ro_after_init;
+/// Software SECDED — Hamming(72,64) core for critical-structure scrubbing.
+pub mod soft_ecc;
 /// Splice guard — FFI for fs/splice.c write permission checks.
 pub mod splice_guard;
