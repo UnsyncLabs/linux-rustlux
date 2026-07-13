@@ -69,8 +69,8 @@ make release-build
 ```bash
 cd linux-rustlux/pkg/arch
 
-# I use this command for my AMD PC
-_use_llvm_lto=thin _processor_opt=zen4 _build_zfs=yes makepkg -si
+# I use this command for my AMD PC for gaming., hardened can give problems with proton.
+_hardened=no _processor_opt=zen4 makepkg -si
 
 # If you fail building, add the GPG keys:
 # gpg --recv-keys XXXXXXXXXXXXXXXA
