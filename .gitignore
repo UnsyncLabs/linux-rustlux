@@ -23,6 +23,11 @@ tools/ccc/
 *.x509
 signing_key.*
 
+# Excepción: el certificado PÚBLICO del repo, que prepare() hornea en
+# CONFIG_SYSTEM_TRUSTED_KEYS. Su clave privada vive solo en el firmador y
+# no debe entrar acá — la regla *.pem de arriba sigue cubriendo al resto.
+!pkg/arch/certs/UnsyncLabs.pem
+
 # ── Editor / IDE ─────────────────────────────────────────────────
 .vscode/
 .idea/

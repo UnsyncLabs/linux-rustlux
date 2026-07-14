@@ -79,6 +79,30 @@
 # aplica al arbol de los modulos NVIDIA open (DKMS), no a este kernel.
 : "${_bigscreen_beyond:=yes}"
 
+## Llaves de confianza horneadas en el kernel (.builtin_trusted_keys)
+# Un modulo firmado con alguna de estas llaves carga sin marcar el kernel
+# ("E" en /proc/sys/kernel/tainted) y es aceptado bajo Secure Boot sin tener
+# que enrolar nada con mokutil.
+#
+# Esto NO reemplaza CONFIG_MODULE_SIG_KEY: los modulos in-tree se siguen
+# firmando con la llave efimera que el build autogenera en certs/signing_key.pem
+# (distinta en cada compilacion). Estas son anchors adicionales.
+#
+# "yes" = hornea el cert publico del repo UnsyncLabs (certs/UnsyncLabs.pem).
+#         Solo el cert; la llave privada vive unicamente en el firmador.
+# "no"  = kernel sin anchors extra.
+: "${_trust_repo_key:=yes}"
+
+## Cert extra a hornear. Caso tipico: la MOK con la que DKMS firma los modulos
+## que compilas en esta maquina, para que nvidia/r8125 no marquen el kernel:
+##   _local_trusted_key=/var/lib/dkms/mok.pub makepkg -s
+## Acepta DER o PEM (se convierte solo).
+##
+## CUIDADO: quien tenga la llave privada de este cert puede firmar un modulo
+## que cargara en CUALQUIER maquina que instale este paquete. Dejalo vacio en
+## los builds que vayas a publicar en el repo.
+: "${_local_trusted_key:=}"
+
 ## Modulos extra
 : "${_build_zfs:=no}"
 : "${_build_nvidia_open:=no}"
@@ -121,7 +145,7 @@ pkgbase="linux-${_pkgsuffix}"
 _major=7.0
 _minor=9
 pkgver=${_major}.${_minor}
-pkgrel=2
+pkgrel=3
 _srcname="linux-${pkgver}"
 pkgdesc="Rustlux Kernel — BORE+EEVDF, hardened, Rust-enabled"
 arch=('x86_64')
@@ -148,6 +172,7 @@ fi
 
 _patchdir="${startdir}/../../patches"
 _configdir="${startdir}/../../config"
+_certdir="${startdir}/certs"
 
 source=(
     "https://cdn.kernel.org/pub/linux/kernel/v${_major%%.*}.x/${_srcname}.tar.xz"
@@ -358,6 +383,47 @@ prepare() {
     # ── Use current config ───────────────────────────────────────────────────
     if [ "$_use_current" = "yes" ] && [[ -s /proc/config.gz ]]; then
         zcat /proc/config.gz > .config
+    fi
+
+    # ── Llaves de confianza (.builtin_trusted_keys) ──────────────────────────
+    # Se arma un PEM concatenado; CONFIG_SYSTEM_TRUSTED_KEYS acepta varios
+    # certs en un mismo archivo. La ruta es relativa al arbol del kernel.
+    _trusted_pem="certs/rustlux_trusted.pem"
+    : > "${_trusted_pem}"
+
+    if [ "$_trust_repo_key" = "yes" ]; then
+        [ -r "${_certdir}/UnsyncLabs.pem" ] \
+            || _die "_trust_repo_key=yes pero falta ${_certdir}/UnsyncLabs.pem"
+        cat "${_certdir}/UnsyncLabs.pem" >> "${_trusted_pem}"
+        echo "Trusted key: $(openssl x509 -in "${_certdir}/UnsyncLabs.pem" -noout -subject)"
+    fi
+
+    if [ -n "$_local_trusted_key" ]; then
+        [ -r "$_local_trusted_key" ] \
+            || _die "No se puede leer _local_trusted_key=$_local_trusted_key"
+        # DKMS guarda mok.pub en DER; SYSTEM_TRUSTED_KEYS solo lee PEM.
+        # El formato se detecta por contenido y no preguntandole a openssl:
+        # openssl >=3.6 autodetecta y acepta "-inform DER" sobre un PEM (y al
+        # reves), asi que no sirve para distinguirlos. PEM es texto con cabecera,
+        # DER es binario — eso si es inequivoco en cualquier version.
+        if grep -q -- '-----BEGIN CERTIFICATE-----' "$_local_trusted_key" 2>/dev/null; then
+            _local_inform=PEM
+        else
+            _local_inform=DER
+        fi
+        openssl x509 -inform "$_local_inform" -in "$_local_trusted_key" \
+            -outform PEM >> "${_trusted_pem}" \
+            || _die "$_local_trusted_key no es un cert X.509 valido (probado como ${_local_inform})"
+        echo "Trusted key: $(openssl x509 -inform "$_local_inform" \
+            -in "$_local_trusted_key" -noout -subject) (local, ${_local_inform})"
+    fi
+
+    if [ -s "${_trusted_pem}" ]; then
+        scripts/config --set-str SYSTEM_TRUSTED_KEYS "${_trusted_pem}"
+        echo "SYSTEM_TRUSTED_KEYS: $(grep -c 'BEGIN CERTIFICATE' "${_trusted_pem}") cert(s)"
+    else
+        scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+        echo "SYSTEM_TRUSTED_KEYS: none"
     fi
 
     # ── Finalize ─────────────────────────────────────────────────────────────

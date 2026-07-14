@@ -97,9 +97,55 @@ _hardened=no makepkg -si
 # Without the Bigscreen Beyond / Beyond 2 VR patches (default: on)
 _bigscreen_beyond=no makepkg -si
 
+# Trust the MOK your local DKMS signs with, so out-of-tree modules
+# (nvidia, r8125, ...) stop tainting the kernel — see "Module signing"
+_local_trusted_key=/var/lib/dkms/mok.pub makepkg -si
+
 # Combined (all options)
 _use_llvm_lto=thin _processor_opt=zen4 _build_zfs=yes makepkg -si
 ```
+
+## Module signing
+
+In-tree modules are signed during the build (`CONFIG_MODULE_SIG_ALL=y`,
+ECDSA/sha512) with a throwaway key the build generates in
+`certs/signing_key.pem` — a different one on every compile.
+`CONFIG_MODULE_SIG_FORCE` is off, so unsigned modules still load; they
+just taint the kernel.
+
+On top of that, these certificates are baked into `.builtin_trusted_keys`:
+
+| Cert | Baked in by | Purpose |
+|---|---|---|
+| `CN=UnsyncLabs` (`pkg/arch/certs/UnsyncLabs.pem`) | `_trust_repo_key=yes`, the default | Modules signed by the repo load untainted. The private key lives only on the signer |
+| whatever `_local_trusted_key` points at | opt-in, empty by default | Typically `/var/lib/dkms/mok.pub`, so DKMS modules built on this machine load untainted |
+
+Reading `/proc/sys/kernel/tainted`: `O` (4096) just means a module is
+out-of-tree and is unavoidable for DKMS. `E` (8192) means its signature
+was not verified against a trusted key — that is what these certs remove.
+`12288` is both.
+
+> `_local_trusted_key` bakes a trust anchor into the package itself.
+> Anyone holding that key's private half can sign a module that loads on
+> **every machine that installs the resulting kernel**. Leave it unset for
+> builds you intend to publish.
+
+### Secure Boot
+
+Nothing above needs Secure Boot, and `mokutil` is pointless without it —
+the `.machine` keyring stays empty when Secure Boot is off, so the kernel
+ignores the MOK list entirely.
+
+With Secure Boot on, enroll the repo's cert so shim will run the kernel:
+
+```bash
+sudo ./scripts/use_repo_mok.sh          # fetches the cert, checks the fingerprint, enrolls
+./scripts/use_repo_mok.sh --show        # just print it
+```
+
+Enrolling a MOK means your machine will load **any** module signed by
+that key without asking. Verify the fingerprint out of band before you
+accept it.
 
 ## Bigscreen Beyond / Beyond 2
 
