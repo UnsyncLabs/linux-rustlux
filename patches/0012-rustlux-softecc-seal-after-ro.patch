@@ -1,0 +1,125 @@
+rustlux_softecc: baseline __ro_after_init after mark_readonly()
+
+rustlux_softecc_init() runs at late_initcall and computed the shadow SECDED
+codes right there. __ro_after_init is not read-only yet at that point:
+mark_rodata_ro() only runs from kernel_init() once every initcall has
+finished, and later initcalls keep writing __ro_after_init variables. The
+baseline therefore captured half-initialised data, and the first scrub pass
+diffed live memory against it.
+
+The fallout was not just noise. A legitimate post-baseline write that flipped
+an even number of bits produced a non-zero syndrome with intact parity, which
+the verifier reports as UNCORRECTABLE ("kernel state is not trustworthy") —
+that is the boot spam. Worse, an odd number of flipped bits landed in the
+CORRECTED path, where softecc_fix_word() takes the page RW and writes the
+*stale* value back over the correct one: the scrubber actively corrupted the
+kernel it was meant to protect.
+
+Register the regions at late_initcall as before, but move both the baseline
+and the scrubber start into rustlux_softecc_seal_all(), called from
+kernel_init() immediately after mark_readonly(). That is the first moment the
+section is genuinely read-only with no legitimate writer left, so any later
+mismatch really is DRAM changing underneath us.
+
+--- a/init/main.c
++++ b/init/main.c
+@@ -67,6 +67,7 @@
+ #include <linux/debugobjects.h>
+ #include <linux/lockdep.h>
+ #include <linux/kmemleak.h>
++#include <linux/rustlux_softecc.h>
+ #include <linux/padata.h>
+ #include <linux/pid_namespace.h>
+ #include <linux/device/driver.h>
+@@ -1591,6 +1592,13 @@
+ 	mark_readonly();
+ 
+ 	/*
++	 * __ro_after_init is only now actually read-only, so this is the
++	 * first point where its contents can be baselined without racing
++	 * legitimate initcall writes.
++	 */
++	rustlux_softecc_seal_all();
++
++	/*
+ 	 * Kernel mappings are now finalized - update the userspace page-table
+ 	 * to finalize PTI.
+ 	 */
+--- a/include/linux/rustlux_softecc.h
++++ b/include/linux/rustlux_softecc.h
+@@ -83,6 +83,20 @@
+  */
+ void rustlux_softecc_reseal(void *addr);
+ 
++/**
++ * rustlux_softecc_seal_all - baseline every region and start scrubbing
++ *
++ * Called from kernel_init() right after mark_readonly(). Regions are
++ * registered during init, but __ro_after_init is still writable then and
++ * later initcalls keep updating it, so the codes computed at registration
++ * describe half-initialised data. Re-encoding here — once the section is
++ * actually read-only and no legitimate writer is left — is what makes a
++ * later mismatch mean "the DRAM changed under us" rather than "init had
++ * not finished yet". The scrubber is only started from here for the same
++ * reason.
++ */
++void rustlux_softecc_seal_all(void);
++
+ #else /* !CONFIG_RUSTLUX_SOFTECC */
+ 
+ static inline int rustlux_softecc_protect(const char *name, void *addr,
+@@ -91,6 +105,7 @@
+ 	return 0;
+ }
+ static inline void rustlux_softecc_reseal(void *addr) { }
++static inline void rustlux_softecc_seal_all(void) { }
+ 
+ #endif /* CONFIG_RUSTLUX_SOFTECC */
+ 
+--- a/mm/rustlux_softecc.c
++++ b/mm/rustlux_softecc.c
+@@ -264,6 +264,24 @@
+ 	},
+ };
+ 
++void rustlux_softecc_seal_all(void)
++{
++	struct softecc_region *r;
++	size_t i;
++
++	mutex_lock(&softecc_lock);
++	list_for_each_entry(r, &softecc_regions, list)
++		for (i = 0; i < r->words; i++)
++			r->codes[i] =
++				rustlux_softecc_encode(READ_ONCE(r->addr[i]));
++	mutex_unlock(&softecc_lock);
++
++	pr_info("rustlux_softecc: sealed after mark_readonly(), scrubber armed\n");
++
++	schedule_delayed_work(&softecc_work,
++		msecs_to_jiffies(READ_ONCE(sysctl_softecc_interval_ms)));
++}
++
+ static int __init rustlux_softecc_init(void)
+ {
+ 	/*
+@@ -271,14 +289,17 @@
+ 	 * is needed. The IDT registers itself from
+ 	 * arch/x86/kernel/idt.c; page tables and creds need write-path
+ 	 * hooks — future work (see header).
++	 *
++	 * Only register here: __ro_after_init is still writable at
++	 * late_initcall time and later initcalls keep writing it, so both
++	 * the baseline and the scrubber have to wait for
++	 * rustlux_softecc_seal_all() (kernel_init(), after mark_readonly()).
+ 	 */
+ 	rustlux_softecc_protect("ro_after_init", __start_ro_after_init,
+ 				__end_ro_after_init - __start_ro_after_init,
+ 				true);
+ 
+ 	register_sysctl_init("vm", rustlux_softecc_sysctls);
+-	schedule_delayed_work(&softecc_work,
+-		msecs_to_jiffies(sysctl_softecc_interval_ms));
+ 	return 0;
+ }
+ late_initcall(rustlux_softecc_init);

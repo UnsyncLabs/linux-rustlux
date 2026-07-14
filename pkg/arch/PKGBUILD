@@ -121,7 +121,7 @@ pkgbase="linux-${_pkgsuffix}"
 _major=7.0
 _minor=9
 pkgver=${_major}.${_minor}
-pkgrel=1
+pkgrel=2
 _srcname="linux-${pkgver}"
 pkgdesc="Rustlux Kernel — BORE+EEVDF, hardened, Rust-enabled"
 arch=('x86_64')
@@ -210,6 +210,9 @@ prepare() {
 
     echo "Applying Rustlux soft-ECC (critical structure scrubbing)..."
     patch -Np1 -i "${_patchdir}/0009-rustlux-soft-ecc.patch"
+
+    echo "Applying Rustlux soft-ECC seal-after-mark_readonly fix..."
+    patch -Np1 -i "${_patchdir}/0012-rustlux-softecc-seal-after-ro.patch"
 
     if [ "$_bigscreen_beyond" = "yes" ]; then
         echo "Applying Bigscreen Beyond display support (DRM/EDID DSC bpp)..."
@@ -399,7 +402,7 @@ build() {
 
 _package() {
     pkgdesc="Rustlux Kernel ${pkgver} — BORE+EEVDF hardened Rust-enabled"
-    depends=('coreutils' 'kmod' 'initramfs')
+    depends=('coreutils' 'kmod' 'initramfs' 'linux-rustlux-common')
     optdepends=(
         'wireless-regdb: correct wireless channels'
         'linux-firmware: firmware for hardware'
@@ -420,15 +423,10 @@ _package() {
 
     rm -f "$modulesdir"/build
 
-    # modprobe configs
-    install -Dm644 "${_configdir}/modprobe.d/rustlux-security.conf" \
-        "${pkgdir}/usr/lib/modprobe.d/rustlux-security.conf"
-    install -Dm644 "${_configdir}/modprobe.d/rustlux-defaults.conf" \
-        "${pkgdir}/usr/lib/modprobe.d/rustlux-defaults.conf"
-
-    # sysctl hardening
-    install -Dm644 "${_configdir}/sysctl.d/90-rustlux-hardening.conf" \
-        "${pkgdir}/usr/lib/sysctl.d/90-rustlux-hardening.conf"
+    # modprobe/sysctl configs moved to linux-rustlux-common (see the
+    # linux-rustlux-packaging repo): installing them per kernel variant
+    # caused pacman file-ownership conflicts when multiple variants
+    # (e.g. zen4 + lto-zen4) are installed side by side.
 }
 
 _package-headers() {
