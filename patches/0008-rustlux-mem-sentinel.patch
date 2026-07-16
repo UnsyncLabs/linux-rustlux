@@ -9,8 +9,8 @@ diff -ruN a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
  
  #include <asm/fred.h>
  #include <asm/cpu_device_id.h>
-@@ -152,6 +153,14 @@
- 
+@@ -151,6 +152,14 @@
+
  void mce_log(struct mce_hw_err *err)
  {
 +	/*
@@ -21,9 +21,9 @@ diff -ruN a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
 +	 */
 +	rustlux_memsentinel_record(&err->m);
 +
- 	if (mce_gen_pool_add(err))
+ 	if (mce_gen_pool_add(err)) {
+ 		pr_info(HW_ERR "Machine check events logged\n");
  		irq_work_queue(&mce_irq_work);
- }
 diff -ruN a/include/linux/rustlux_memsentinel.h b/include/linux/rustlux_memsentinel.h
 --- a/include/linux/rustlux_memsentinel.h
 +++ b/include/linux/rustlux_memsentinel.h

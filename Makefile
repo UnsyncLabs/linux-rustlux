@@ -10,7 +10,7 @@
 #   make qemu          — arrancar en QEMU x86_64 con initramfs mínimo
 
 # ── Versión del kernel base ──────────────────────────────────────────────────
-KERNEL_VERSION  := 7.0.9
+KERNEL_VERSION  := 7.1.3
 KERNEL_NAME     := linux-$(KERNEL_VERSION)
 KERNEL_URL      := https://cdn.kernel.org/pub/linux/kernel/v7.x/$(KERNEL_NAME).tar.xz
 

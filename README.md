@@ -2,7 +2,30 @@
 
 A memory-safe Linux kernel with the BORE+EEVDF scheduler, aggressive hardening, and protection against page-cache write vulnerabilities.
 
-Based on Linux 7.0.9. Compatible with Arch Linux, CachyOS, and Artix.
+Based on Linux 7.1.3. Compatible with Arch Linux, CachyOS, and Artix.
+
+> [!WARNING]
+> **Rustlux 7.0.9 and earlier are affected by CVE-2026-46242 ("Bad Epoll") and must not be used.**
+>
+> A local, unprivileged user can win a close-vs-close race in epoll's file-release
+> path, turn the resulting use-after-free into control of a `struct file`, and
+> escalate to root. A public proof-of-concept exists and is reported to be ~99%
+> reliable. Every kernel from 6.4 onward is affected; upstream fixed it in
+> **7.0.10** (`a6dc643c6931`), one release after the Rustlux 7.0.9 base.
+>
+> None of Rustlux's own hardening blocks this: the bug is in `fs/eventpoll.c`,
+> which Rustlux does not patch.
+>
+> The whole 7.0.x series is also **end-of-life** since 2026-06-27, so it will
+> receive no further fixes. `main` now tracks 7.1.3. The old tree is preserved,
+> unfixed, on the [`linux-7.0.9-eol`](../../tree/linux-7.0.9-eol) branch for
+> reference only — **do not build or run it**.
+>
+> If you installed a Rustlux 7.0.x package, update now:
+>
+> ```bash
+> sudo pacman -Syu
+> ```
 
 ## Features
 
@@ -136,16 +159,31 @@ Nothing above needs Secure Boot, and `mokutil` is pointless without it —
 the `.machine` keyring stays empty when Secure Boot is off, so the kernel
 ignores the MOK list entirely.
 
-With Secure Boot on, enroll the repo's cert so shim will run the kernel:
+**The packages ship an unsigned `vmlinuz`.** Baked certificates cover
+module loading only; they say nothing about the kernel image itself. With
+Secure Boot on, the firmware validates that image before the kernel exists,
+so an unsigned one simply will not boot.
+
+Sign it with **your own** keys:
 
 ```bash
-sudo ./scripts/use_repo_mok.sh          # fetches the cert, checks the fingerprint, enrolls
-./scripts/use_repo_mok.sh --show        # just print it
+sudo pacman -S sbctl
+sudo ./scripts/secureboot_sign.sh          # signs the installed rustlux vmlinuz
+./scripts/secureboot_sign.sh --status      # show state, change nothing
 ```
 
-Enrolling a MOK means your machine will load **any** module signed by
-that key without asking. Verify the fingerprint out of band before you
-accept it.
+`sbctl sign -s` registers each file, and sbctl's pacman hook re-signs it
+after every kernel update, so this is a one-time step.
+
+This deliberately does **not** use a repo key. Signing the image with
+UnsyncLabs would mean either shipping its private half off the signer, or
+asking you to let a third party sign something your firmware will execute.
+Your own keys avoid both.
+
+> `sbctl enroll-keys` replaces the firmware's Secure Boot keys with yours.
+> Pass `--microsoft` to keep Microsoft's, or option ROMs (many GPUs and NICs)
+> and dual-booted Windows can stop working. Some firmware handles this badly.
+> Know how to restore factory keys before you run it.
 
 ## Bigscreen Beyond / Beyond 2
 
@@ -183,7 +221,7 @@ makepkg -si
 │   ├── rustlux_sched/      BORE scheduler implementation
 │   ├── rustlux_security/   Hardening config, capabilities, FFI
 │   └── rustlux_bindings.h  C header for FFI declarations
-├── patches/                Patches applied over Linux 7.0.9
+├── patches/                Patches applied over Linux 7.1.3
 │   ├── 0001-hardened.patch         Security hardening
 │   ├── 0002-bore-cachy.patch       BORE scheduler
 │   ├── 0003-dkms-clang.patch       DKMS compatibility
@@ -326,7 +364,7 @@ echo "vm.rustlux_memsentinel_threshold = 4" | sudo tee /etc/sysctl.d/99-rustlux-
 
 ## Note on CONFIG_RUST + LTO
 
-Linux 7.0.9 has a Kconfig constraint: `CONFIG_RUST` cannot coexist with `DEBUG_INFO_BTF` when LTO is enabled. The PKGBUILD automatically disables BTF when building with LTO to allow Rust compilation. This means `bpftool` BTF features won't be available in LTO+Rust builds.
+Linux 7.1.3 has a Kconfig constraint: `CONFIG_RUST` cannot coexist with `DEBUG_INFO_BTF` when LTO is enabled. The PKGBUILD automatically disables BTF when building with LTO to allow Rust compilation. This means `bpftool` BTF features won't be available in LTO+Rust builds.
 
 ## License
 
